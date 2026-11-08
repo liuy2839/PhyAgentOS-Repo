@@ -31,8 +31,6 @@ src/rekep_policy/
 ├── assembly.py            # 真实算法装配（rekep_alg + IK + 规划器）
 └── main.py                # 节点入口：PolicyRuntime 驱动
 rekep_alg/                 # 算法核心（感知/规划+沙箱/执行状态机）
-skill/                     # PAOS manifest v2 / SKILL.md / profile dataflow
-build_node.sh              # PyInstaller 单文件节点构建
 ```
 
 ## 关键环境变量
@@ -48,9 +46,9 @@ build_node.sh              # PyInstaller 单文件节点构建
 
 ## 运行
 
-源码部署：`dora run dataflow.rekep.yaml`（见 `skill/profiles/robodojo-rekep`）。
-单文件制品：用 `bash build_node.sh` 生成
-`dist/rekep_policy-<ver>-linux-x86_64.tar.gz` 与 `skill/skill.yaml`。
+源码部署：`dora run dataflow.example.yaml`（路径为占位符，按部署机补齐；评测侧
+是独立节点 `nodes/benchmarks/robodojo_eval/`，本策略需要其 `config.yaml` 开
+`publish_scene_objects: true`）。
 
 ## 已知边界
 
@@ -68,6 +66,7 @@ build_node.sh              # PyInstaller 单文件节点构建
   开始运动，2–17 步内出现 `CUDA_ERROR_ILLEGAL_ADDRESS`（已排除干扰物数量因素：
   仅保留 1 个物体仍复现）。已加动作护栏（位姿校验、避障半径、离地钳制），
   仍需在环境/驱动稳定后复测。
-- **并行开发注意**：同一仓库/服务器上另有 PAOS `bench_tool` 改造在进行，
-  评测入口可能变化；稳定后建议按 `NEW_POLICY_GUIDE.md` 的 Skill 流程
-  （`paos skill start robodojo-bench --profile rekep`）运行，而不是直接 `dora run`。
+- **并行开发注意（2026-10-29 记录，已被后续变更取代）**：当时的 PAOS `bench_tool`
+  Skill 流程（`paos skill start robodojo-bench`）已从本仓库移除；现在的评测入口是
+  独立节点 `robodojo_eval`，由 `eval_command` 逐回合驱动
+  （见 `nodes/benchmarks/robodojo_eval/README.md`）。

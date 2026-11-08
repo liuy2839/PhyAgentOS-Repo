@@ -32,8 +32,6 @@ src/rekep_policy/
 ├── assembly.py            # real assembly (rekep_alg + IK + planner)
 └── main.py                # node entrypoint driven by PolicyRuntime
 rekep_alg/                 # algorithm core (perception / planner+sandbox / executor state machine)
-skill/                     # PAOS manifest v2 / SKILL.md / profile dataflow
-build_node.sh              # PyInstaller single-file node build
 ```
 
 ## Environment variables
@@ -49,9 +47,10 @@ build_node.sh              # PyInstaller single-file node build
 
 ## Run
 
-From source: `dora run dataflow.rekep.yaml` (see `skill/profiles/robodojo-rekep`).
-Single-file artifact: `bash build_node.sh` produces
-`dist/rekep_policy-<ver>-linux-x86_64.tar.gz` and `skill/skill.yaml`.
+From source against the standalone eval node:
+`dora run dataflow.example.yaml` (paths are per-host placeholders; the eval
+side is `nodes/benchmarks/robodojo_eval/`, which needs
+`publish_scene_objects: true` in its `config.yaml` for this policy).
 
 ## Known boundaries
 
@@ -72,7 +71,7 @@ Single-file artifact: `bash build_node.sh` produces
   as soon as the arm moves, `CUDA_ERROR_ILLEGAL_ADDRESS` appears within 2–17 steps
   (reproduced with a single object, so clutter count is not the trigger). Action guards
   were added; retest pending a stable environment/driver.
-- **Concurrent work**: a PAOS `bench_tool` refactor is in progress in the same repo and
-  host, so the eval entrypoint may change. Once stable, run through the Skill flow in
-  `NEW_POLICY_GUIDE.md` (`paos skill start robodojo-bench --profile rekep`) instead of a
-  bare `dora run`.
+- **Concurrent work note (2026-10-29)**: the original PAOS `bench_tool` skill flow
+  (`paos skill start robodojo-bench`) has since been removed from this repo; the
+  evaluation entrypoint is now the standalone `robodojo_eval` node driven via
+  `eval_command` (see `nodes/benchmarks/robodojo_eval/README.md`).

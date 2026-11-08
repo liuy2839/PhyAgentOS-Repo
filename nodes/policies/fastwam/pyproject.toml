@@ -1,0 +1,15 @@
+[project]
+name = "forge-policy-fastwam"
+version = "0.1.0"
+description = "FastWAM_80k_forge 策略节点：统一策略协议上的 XPolicyLab 适配"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "dora-rs==0.4.1",
+    "numpy",
+    "pyarrow",
+    "forge-policy",
+]
+
+[tool.uv.sources]
+forge-policy = { path = "../../../policy" }

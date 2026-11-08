@@ -1,6 +1,0 @@
-nodes:
-  - id: python_probe
-    path: /usr/bin/env
-    args: /data0/liuyi/g05_eval/bin/python -u /data0/liuyi/forge_robodojo_eval/robodojo/python_probe.py
-    env:
-      PYTHONPATH: /data0/liuyi/robodojo/RoboDojo/XPolicyLab/policy/G05/G05/src:/data0/liuyi/robodojo/RoboDojo/XPolicyLab/policy/G05/G05
