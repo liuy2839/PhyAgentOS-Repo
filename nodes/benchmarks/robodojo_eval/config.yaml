@@ -1,0 +1,26 @@
+# 评测发起节点配置（数据面加载）。
+# 用法：EVAL_CONFIG=/abs/path/config.yaml ROBODOJO_ROOT=/abs/path/RoboDojo python main.py
+#
+# 批次/护栏/suite 都不再在这里 —— 一次 eval_command = 一个回合，任务/布局/
+# 轮次/指令在命令里（接口①）。这里只定环境口径和落盘位置。
+
+benchmark: robodojo
+env_cfg_type: arx_x5      # ARX X5 双臂，对应 env_cfg/arx_x5.yml
+device_id: 0              # 进程可见的 GPU 序号（外面用 CUDA_VISIBLE_DEVICES 选卡）
+action_type: joint        # 必须与策略 deploy.yml 一致
+policy_id: FastWAM_80k_forge   # 仅用于官方配置组装与结果标注
+additional_info: forge
+seed: 0                   # 官方 eval_cfg["seed"]；布局 ID 在 eval_command 的 layout_id 里逐回合给
+
+# output_dir 未在命令里给出时的落盘根目录。
+# 建议部署时改成共享盘的绝对路径（如 /data2/kangning/rsi/runs/ 下自建子目录，
+# v2 文档确认该目录对所有人开放写）；相对路径会在启动时解析成节点目录下的绝对路径。
+result_dir: ./rsi_results
+
+# 等 action 的看门狗周期（秒）
+watchdog_s: 20.0
+
+camera_map:
+  image/head: cam_head
+  image/left_wrist: cam_left_wrist
+  image/right_wrist: cam_right_wrist

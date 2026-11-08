@@ -1,0 +1,75 @@
+# FastWAM 三轮 RSI 的两节点评测闭环（接口①② 见 FastWAM_RSI_分工与接口_v2.md 第 3.2 节）
+#
+# 跑：dora run dataflow.yaml
+#
+# 两个节点**必须用不同的 python**（与原 forge 流程同样的硬约束）：
+#   评测侧要 isaacsim 5.1（RoboDojo conda env，py3.10）
+#   策略侧要 FastWAM/XPOLICYLAB 依赖（独立 env）
+# 原 forge 流程的 gateway / bench_tool（forge-tool 工具面）已全部去掉 ——
+# 本 dataflow 只有数据平面，编排方（模块 D）经 eval_command 逐回合驱动。
+#
+# 拓扑：
+#   编排 ──eval_command──► robodojo_eval（Isaac Sim 数据面）
+#   robodojo_eval ──policy_command / proprio_state / image/*──► fastwam_policy
+#   fastwam_policy ──action──► robodojo_eval
+#   robodojo_eval ──eval_status / eval_result──► 编排方订阅（或 dora 侧录文件）
+
+nodes:
+  - id: robodojo_eval
+    path: <ROBODOJO_ENV>/bin/python
+    args: -u <REPO>/nodes/benchmarks/robodojo_eval/main.py
+    env:
+      EVAL_CONFIG: <REPO>/nodes/benchmarks/robodojo_eval/config.yaml
+      ROBODOJO_ROOT: <ROBODOJO_REPO_ROOT>
+      PYTHONPATH: <ROBODOJO_REPO_ROOT>/XPolicyLab
+      # Omniverse 自己枚举物理设备，与 CUDA 枚举不是一套 —— 选卡用 config.yaml
+      # 的 device_id，不要设 CUDA_VISIBLE_DEVICES。
+      LD_LIBRARY_PATH: <ROBODOJO_ENV>/lib
+      OMNI_KIT_ACCEPT_EULA: "YES"
+      # IsaacLab 日志写 tempfile.gettempdir()/isaaclab；共享机 /tmp/isaaclab
+      # 被其他用户先建（属主不合）会 PermissionError → 两集全灭，指到自己的目录。
+      TMPDIR: <HOME>/tmp
+      TEMP: <HOME>/tmp
+      TMP: <HOME>/tmp
+    inputs:
+      eval_command: <ORCHESTRATOR>/eval_command
+      action: fastwam_policy/action
+    outputs:
+      - proprio_state
+      - image/head
+      - image/left_wrist
+      - image/right_wrist
+      - policy_command
+      - eval_status
+      - eval_result
+
+  - id: fastwam_policy
+    path: <FASTWAM_POLICY_ENV>/bin/python
+    args: -u -m fastwam_policy.main
+    env:
+      PYTHONPATH: <REPO>/policy/src:<REPO>/nodes/policies/fastwam/src
+      XPOLICYLAB_ROOT: <ROBODOJO_REPO_ROOT>/XPolicyLab
+      POLICY_NAME: FastWAM_80k_forge
+      ENV_CFG_TYPE: arx_x5
+      ACTION_TYPE: joint
+      # FastWAM 的权重/文本特征路径已写进其 deploy.yml（fastwam_eval/RoboDojo/
+      # XPolicyLab/policy/FastWAM_80k_forge/）；如需覆盖再加 CKPT_NAME。
+      # dora 依赖在 /data2/kangning/rsi/pydeps_forge/，加载方式见
+      # /data2/kangning/rsi/README.md 第 2 节。
+      CUDA_VISIBLE_DEVICES: "0"
+    inputs:
+      tick: dora/timer/millis/20      # 只当心跳，绝不在 tick 上推理
+      policy_command:
+        source: robodojo_eval/policy_command
+        # 必须 ≥32（forge_policy contract.MIN_POLICY_COMMAND_QUEUE）：回合边界
+        # 会连发 start + set_instruction + reset_scene + set_instruction 四条
+        # PolicyCommand，默认队列深度会把前面的挤掉 —— 表现为拿着上一句指令
+        # 跑完，照样出分，不报错。
+        queue_size: 32
+      proprio_state: robodojo_eval/proprio_state
+      image/head: robodojo_eval/image/head
+      image/left_wrist: robodojo_eval/image/left_wrist
+      image/right_wrist: robodojo_eval/image/right_wrist
+    outputs:
+      - action
+      - policy_status

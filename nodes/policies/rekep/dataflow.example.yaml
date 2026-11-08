@@ -1,61 +1,59 @@
-# ReKep 策略接入 RoboDojo 评测链路（arx_x5, action_type=ee）
+# ReKep 策略接入 RoboDojo 评测（arx_x5, action_type=ee）
 #
-# 与 G05 dataflow 相同的两节点拓扑，policy 节点换成 rekep_policy：
+# 两节点拓扑：robodojo_eval（评测发起独立节点）+ rekep_policy（forge_policy SDK）。
 #   - 动作空间是 ee（末端位姿），由 RoboDojo 环境内部 cuRobo 解 IK；
-#   - 环境观测无 depth/seg，策略用 scene_objects（物体真值位姿）构建 perception。
+#   - 环境观测无 depth/seg，策略用 scene_objects（物体真值位姿）构建 perception，
+#     评测节点 config.yaml 需开 publish_scene_objects: true。
 #
-# 跑：dora run dataflow.rekep.yaml（需先在 zyserver 部署，见 README）
+# 跑：dora run dataflow.example.yaml（占位路径按部署机补齐）
 
 nodes:
-  - id: robodojo_benchmark
-    path: /data0/liuyi/miniconda3/envs/RoboDojo/bin/python
-    args: -u /data0/liuyi/forge_robodojo_eval/robodojo/main.py
+  - id: robodojo_eval
+    path: <ROBODOJO_ENV>/bin/python
+    args: -u <REPO>/nodes/benchmarks/robodojo_eval/main.py
     env:
-      BENCHMARK_CONFIG: /data0/liuyi/forge_robodojo_eval/robodojo/config.rekep.yaml
-      ROBODOJO_ROOT: /data0/liuyi/robodojo/RoboDojo
-      PYTHONPATH: /data0/liuyi/robodojo/RoboDojo/XPolicyLab
+      EVAL_CONFIG: <REPO>/nodes/benchmarks/robodojo_eval/config.yaml
+      ROBODOJO_ROOT: <ROBODOJO_REPO_ROOT>
+      PYTHONPATH: <ROBODOJO_REPO_ROOT>/XPolicyLab
       CUDA_VISIBLE_DEVICES: "0,1,2,3,4,5,6"
-      LD_LIBRARY_PATH: /data0/liuyi/miniconda3/envs/RoboDojo/lib
+      LD_LIBRARY_PATH: <ROBODOJO_ENV>/lib
       OMNI_KIT_ACCEPT_EULA: "YES"
-      # IsaacLab 日志写 tempfile.gettempdir()/isaaclab；/tmp/isaaclab 被其他用户占用
-      TMPDIR: /data0/liuyi/tmp
-      TEMP: /data0/liuyi/tmp
-      TMP: /data0/liuyi/tmp
+      TMPDIR: <HOME>/tmp
+      TEMP: <HOME>/tmp
+      TMP: <HOME>/tmp
     inputs:
+      eval_command: <ORCHESTRATOR>/eval_command
       action: rekep_policy/action
     outputs:
       - proprio_state
       - image/head
-      - image/left_wrist
-      - image/right_wrist
       - depth/head
-      - depth/left_wrist
       - scene_objects
       - camera_info
       - policy_command
-      - benchmark_status
-      - benchmark_result
+      - eval_status
+      - eval_result
 
   - id: rekep_policy
     # 注意：不要直接写 .venv-policy/bin/python —— dora 会把符号链接解析成基础
     # conda 解释器，导致 venv 的 site-packages（mujoco/torch）丢失。
-    path: /data0/liuyi/rekep_policy_dev/run_rekep_policy.sh
-    args: -u -m rekep_policy.main --profile /data0/liuyi/rekep_policy_dev/nodes/policies/rekep/rekep_profile.arx_x5_ee.json --cameras image/head
+    path: <REKEP_ROOT>/run_rekep_policy.sh
+    args: -u -m rekep_policy.main --profile <REKEP_ROOT>/nodes/policies/rekep/rekep_profile.arx_x5_ee.json --cameras image/head
     env:
-      PYTHONPATH: /data0/liuyi/rekep_policy_dev/policy/src:/data0/liuyi/rekep_policy_dev/nodes/policies/rekep/src:/data0/liuyi/rekep_policy_dev/nodes/policies/rekep
-      REKEP_ALG_ROOT: /data0/liuyi/rekep_policy_dev/nodes/policies/rekep
+      PYTHONPATH: <REPO>/policy/src:<REKEP_ROOT>/nodes/policies/rekep/src:<REKEP_ROOT>/nodes/policies/rekep
+      REKEP_ALG_ROOT: <REKEP_ROOT>/nodes/policies/rekep
       # scene_objects：评测端物体真值 → 中心关键点（稳定，已验证跑满 700 步）。
       # dino：深度+DINOv2 视觉感知；实现已就绪，但本机 Isaac 5.1 深度注解器会
       # 触发 CUDA 崩溃，暂不作为默认（见 README「已知边界」）。
       REKEP_PERCEPTION: scene_objects
-      REKEP_DINOV2_REPO: /data0/liuyi/rekep_policy_dev/models/dinov2
-      REKEP_DINOV2_WEIGHTS: /data0/liuyi/rekep_policy_dev/models/weights/dinov2_vits14.pth
+      REKEP_DINOV2_REPO: <REKEP_ROOT>/models/dinov2
+      REKEP_DINOV2_WEIGHTS: <REKEP_ROOT>/models/weights/dinov2_vits14.pth
       REKEP_DINOV2_MODEL: dinov2_vits14
       REKEP_PLAN_SOURCE: template
       # 真实 X5 运动学（RoboDojo 自带 URDF）：求解器的可达性/路径代价用真 IK 评估。
       # ee 动作本身仍由环境内 cuRobo 解算，本 IK 只服务 ReKep 求解器。
       REKEP_IK: x5
-      REKEP_X5_URDF: /data0/liuyi/robodojo/RoboDojo/Assets/Robots/x5/X5A.urdf
+      REKEP_X5_URDF: <ROBODOJO_REPO_ROOT>/Assets/Robots/x5/X5A.urdf
       REKEP_X5_EE_BODY: link6
       REKEP_X5_BASE_POS: "[-0.3, -0.45, 0.765]"
       REKEP_X5_BASE_QUAT_WXYZ: "[0.707, 0.0, 0.0, 0.707]"
@@ -71,13 +69,13 @@ nodes:
     inputs:
       tick: dora/timer/millis/20
       policy_command:
-        source: robodojo_benchmark/policy_command
+        source: robodojo_eval/policy_command
         queue_size: 32
-      proprio_state: robodojo_benchmark/proprio_state
-      image/head: robodojo_benchmark/image/head
-      depth/head: robodojo_benchmark/depth/head
-      scene_objects: robodojo_benchmark/scene_objects
-      camera_info: robodojo_benchmark/camera_info
+      proprio_state: robodojo_eval/proprio_state
+      image/head: robodojo_eval/image/head
+      depth/head: robodojo_eval/depth/head
+      scene_objects: robodojo_eval/scene_objects
+      camera_info: robodojo_eval/camera_info
     outputs:
       - action
       - policy_status
