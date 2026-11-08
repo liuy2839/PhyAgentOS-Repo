@@ -40,8 +40,19 @@ class Policy:
     def set_instruction(self, text: str) -> None:
         """接收本 episode 的自然语言任务指令；下一次 step 前应触发重规划。"""
 
-    def step(self, obs: dict[str, Any]) -> np.ndarray | None:
-        """消费一帧完整观测，返回一个动作向量或 None。"""
+    def step(self, obs: dict[str, Any]) -> "np.ndarray | tuple[np.ndarray, bool] | None":
+        """消费一帧完整观测，返回一个动作向量或 None。
+
+        返回值的三种形态（emit_chunk_end=True 时推荐元组形式）：
+          None                     本帧不动作（如规划中），评测端 watchdog 会重发观测；
+          np.ndarray               本帧动作，**非 chunk 末**（兼容旧用法）；
+          (np.ndarray, bool)       (本帧动作, 是否本 chunk 的末动作)。
+
+        元组形式的 is_last=True 动作由 PolicyRuntime 自动附 effort 哨兵
+        （CHUNK_END_SENTINEL），时序与 RoboDojo 官方 rollout 逐字对齐——
+        补查发生在 chunk 末动作之后、下一帧观测之前。这把"哨兵随末动作"
+        由接口保证，不再依赖策略在正确时机手工调用 mark_chunk_end()。
+        """
         raise NotImplementedError
 
     def shutdown(self) -> None:

@@ -132,6 +132,9 @@ def test_lifecycle_and_lockstep() -> None:
 
 
 def test_action_names_and_chunk_end() -> None:
+    """deprecated 手工置位路径的兼容性测试：置位必须在 step 返回**末动作之前**
+    才能得到正确语义（哨兵随末动作发出）。新代码请用元组返回
+    （test_chunk_end_tuple_return）。"""
     policy = ScriptedPolicy()
     contract = PolicyContract(
         action_names=("j1", "j2", "j3"), cameras=("image/head",), emit_chunk_end=True
@@ -165,6 +168,130 @@ def test_action_names_and_chunk_end() -> None:
     assert cmd.mode == "position"
     assert cmd.effort == [CHUNK_END_SENTINEL] * 3
     assert cmd.position == [0.0, 0.5, 1.0]
+
+
+def test_chunk_end_tuple_return() -> None:
+    """元组返回 (vec, is_last)：哨兵必须只随本 chunk 末动作发出，且时机由
+    接口保证——3 动作 chunk → 第 3 个 action 带 effort 哨兵、前两个不带。
+    这是防回归的核心测试：任何把哨兵错位到下一 chunk 首动作的改动都会在此红。"""
+    policy = ScriptedPolicy()
+    contract = PolicyContract(
+        action_names=("j1", "j2", "j3"), cameras=("image/head",), emit_chunk_end=True
+    )
+    node = FakeNode(
+        [
+            _pc_event("start"),
+            _proprio_event([0.0, 0.0, 0.0], ["j1", "j2", "j3"]),
+            _image_event("image/head"),  # 3 帧完整观测 → 3 个动作（一个 chunk）
+            _proprio_event([0.1, 0.1, 0.1], ["j1", "j2", "j3"]),
+            _image_event("image/head"),
+            _proprio_event([0.2, 0.2, 0.2], ["j1", "j2", "j3"]),
+            _image_event("image/head"),
+            {"type": "STOP"},
+        ]
+    )
+    runtime = PolicyRuntime(policy, contract, node=node, logger=lambda _: None)
+
+    calls = {"n": 0}
+
+    def step_chunked(obs):
+        vec = np.linspace(0.0, 1.0, 3, dtype=np.float64)
+        calls["n"] += 1
+        return vec, (calls["n"] == 3)  # 唯一一个 chunk：第 3 个动作是末动作
+
+    policy.step = step_chunked  # type: ignore[method-assign]
+    runtime.run()
+    from forge_policy.msgs import JointCommand
+
+    actions = [v for topic, v in node.outputs if topic == "action"]
+    assert len(actions) == 3
+    efforts = [JointCommand.from_arrow(v).effort for v in actions]
+    assert efforts[0] == []
+    assert efforts[1] == []
+    assert efforts[2] == [CHUNK_END_SENTINEL] * 3   # 末动作带哨兵
+
+
+def test_chunk_per_action() -> None:
+    """每帧制策略（N=1 chunk）：chunk_per_action=True 时每个动作都带哨兵。"""
+    policy = ScriptedPolicy()
+    contract = PolicyContract(
+        action_names=("j1", "j2", "j3"),
+        cameras=("image/head",),
+        emit_chunk_end=True,
+        chunk_per_action=True,
+    )
+    node = FakeNode(
+        [
+            _pc_event("start"),
+            _proprio_event([0.0, 0.0, 0.0], ["j1", "j2", "j3"]),
+            _image_event("image/head"),
+            _proprio_event([0.1, 0.1, 0.1], ["j1", "j2", "j3"]),
+            _image_event("image/head"),
+            {"type": "STOP"},
+        ]
+    )
+    PolicyRuntime(policy, contract, node=node, logger=lambda _: None).run()
+    from forge_policy.msgs import JointCommand
+
+    actions = [v for topic, v in node.outputs if topic == "action"]
+    assert len(actions) == 2
+    for v in actions:   # 每帧制：每个动作都是决策单元的末动作
+        assert JointCommand.from_arrow(v).effort == [CHUNK_END_SENTINEL] * 3
+
+
+def test_chunk_per_action_requires_emit_chunk_end() -> None:
+    """配置矛盾必须构造即炸：per-action 哨兵依赖 emit_chunk_end 的语义。"""
+    with pytest.raises(ValueError):
+        PolicyContract(action_names=("j1",), chunk_per_action=True)
+
+
+def test_invalid_tuple_return_fails_structured() -> None:
+    """step 返回形态非法（第二元素非 bool）→ 结构化失败 + 无动作发出。"""
+    policy = ScriptedPolicy()
+    node = FakeNode(
+        [
+            _pc_event("start"),
+            _proprio_event([0.0, 0.0, 0.0], ["j1", "j2", "j3"]),
+            _image_event("image/head"),
+            {"type": "STOP"},
+        ]
+    )
+
+    def bad_step(obs):
+        return np.zeros(3), "yes"
+
+    policy.step = bad_step  # type: ignore[method-assign]
+    PolicyRuntime(policy, CONTRACT, node=node, logger=lambda _: None).run()
+    statuses = [
+        json.loads(bytes(v).decode("utf-8"))
+        for topic, v in node.outputs
+        if topic == "policy_status"
+    ]
+    failed = [s for s in statuses if s["status"] == "failed"]
+    assert failed and failed[-1]["error_code"] == "invalid_step_return"
+    assert not [v for topic, v in node.outputs if topic == "action"]
+
+
+def test_legacy_ndarray_return_still_works() -> None:
+    """旧用法（step 返回裸 ndarray）零改动兼容：动作正常发出、不带哨兵。"""
+    policy = ScriptedPolicy()
+    contract = PolicyContract(
+        action_names=("j1", "j2", "j3"), cameras=("image/head",), emit_chunk_end=True
+    )
+    node = FakeNode(
+        [
+            _pc_event("start"),
+            _proprio_event([0.0, 0.0, 0.0], ["j1", "j2", "j3"]),
+            _image_event("image/head"),
+            {"type": "STOP"},
+        ]
+    )
+    PolicyRuntime(policy, contract, node=node, logger=lambda _: None).run()
+    from forge_policy.msgs import JointCommand
+
+    actions = [v for topic, v in node.outputs if topic == "action"]
+    assert len(actions) == 1
+    assert JointCommand.from_arrow(actions[0]).effort == []
 
 
 def test_policy_error_reports_failed_status() -> None:

@@ -1,6 +1,6 @@
 """统一策略节点传输协议（Forge Policy Wire Contract）常量与校验。
 
-约定（与 benchmarks/_core 的评测锁步语义一致）：
+约定（与评测节点的锁步语义一致）：
 - 输入 topic：
     proprio_state : forge_msgs.JointState（命名关节状态）
     image/<cam>   : forge_msgs.Image, encoding=rgb8
@@ -14,8 +14,16 @@
 - 生命周期状态机：idle → ready → running → (idle | terminal)
 - 推理时机：观测驱动。收齐一帧完整观测（proprio + 声明的全部相机）才调用
   策略 step()，至多产出一个 action；评测端按 1:1 锁步消费。
-- chunk 边界（RoboDojo 兼容项，非通用语义）：chunk 最后一个动作的
-  JointCommand.effort 整条填 CHUNK_END_SENTINEL，其余动作 effort 留空。
+- chunk 边界（RoboDojo 兼容项，非通用语义）：RoboDojo 的 is_episode_end()
+  带副作用，官方 rollout 每个 chunk 在「末动作之后、下一帧观测之前」多查
+  一次（每 chunk 2N+1 次），调用次数影响成绩。chunk 末动作的
+  JointCommand.effort 整条填 CHUNK_END_SENTINEL，评测端据此补查那一次。
+  声明方式二选一：
+    * chunk 制策略（如 FastWAM）：step() 返回 (action, is_last) 元组，
+      is_last=True 的动作由 runtime 自动附哨兵——推荐，时机由接口保证；
+    * 每帧制策略（如 ReKep，等价于官方 N=1 chunk，每个动作都是决策单元
+      的末动作）：contract 设 chunk_per_action=True，runtime 给每个动作
+      附哨兵。
 """
 
 from __future__ import annotations
@@ -67,6 +75,10 @@ class PolicyContract:
     scene_objects: bool = False
     camera_info: bool = False
     emit_chunk_end: bool = False
+    # 每帧制策略（每帧重新决策，等价于官方 N=1 chunk）：每个发出的动作都
+    # 视为决策单元的末动作、附 effort 哨兵。必须与 emit_chunk_end=True
+    # 同用（否则是语义矛盾，构造即拒绝）。
+    chunk_per_action: bool = False
 
     def __post_init__(self) -> None:
         if not self.action_names:
@@ -77,6 +89,12 @@ class PolicyContract:
             names = getattr(self, field)
             if len(set(names)) != len(names):
                 raise ValueError(f"{field} 不能有重复相机")
+        if self.chunk_per_action and not self.emit_chunk_end:
+            raise ValueError(
+                "chunk_per_action=True 需要 emit_chunk_end=True：前者只改变"
+                "哨兵的覆盖范围（每个动作 vs 仅元组声明的末动作），不开后者"
+                "等于不发哨兵，属于配置矛盾"
+            )
 
     def required_inputs(self) -> frozenset[str]:
         """一帧完整观测需要收齐的 topic 集合。"""

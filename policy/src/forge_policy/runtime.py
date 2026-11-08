@@ -210,7 +210,34 @@ class PolicyRuntime:
         if action is None:
             return
         self._last_complete_obs = None
-        vec = np.asarray(action, dtype=np.float64).reshape(-1)
+
+        # 解析 step() 的返回形态：
+        #   ndarray            → (动作, 非末动作)（旧用法，零改动兼容）
+        #   (ndarray, bool)    → (动作, is_last)——is_last=True 的动作由
+        #                        runtime 自动附 effort 哨兵（推荐用法）
+        #   其它               → 结构化失败（错误码 invalid_step_return）
+        is_last = False
+        if isinstance(action, tuple):
+            if (
+                len(action) == 2
+                and isinstance(action[1], (bool, np.bool_))
+                and isinstance(action[0], np.ndarray)
+            ):
+                vec_raw, is_last = action[0], bool(action[1])
+            else:
+                self._failed = True
+                self._log(f"step 返回的元组形态非法: {type(action[0]).__name__}, {type(action[1]).__name__}"
+                          if len(action) == 2 else f"step 返回的元组长度非法: {len(action)}")
+                self._emit_status(
+                    POLICY_STATUS_FAILED,
+                    error_code="invalid_step_return",
+                    message="step 应返回 np.ndarray、None 或 (np.ndarray, bool) 元组",
+                )
+                return
+        else:
+            vec_raw = action
+
+        vec = np.asarray(vec_raw, dtype=np.float64).reshape(-1)
         if vec.size != self.contract.action_dim:
             self._failed = True
             self._emit_status(
@@ -225,16 +252,27 @@ class PolicyRuntime:
                 POLICY_STATUS_FAILED, error_code="non_finite_action", message="动作含非有限值"
             )
             return
-        self._send_action(vec)
+        self._send_action(vec, is_last=is_last)
 
-    def _send_action(self, vec: np.ndarray) -> None:
+    def _send_action(self, vec: np.ndarray, is_last: bool = False) -> None:
+        """发送动作；按三优先级决定是否附 effort 哨兵：
+
+        1. chunk_per_action=True        → 每帧制策略，每个动作都是 N=1 chunk
+                                          的末动作，恒附哨兵；
+        2. 元组返回的 is_last=True      → chunk 制策略声明本动作即 chunk 末
+                                          （推荐用法，时机由接口保证）；
+        3. _chunk_pending_end 置位      → deprecated 的手工置位路径，仅为
+                                          兼容保留（见 mark_chunk_end）。
+        """
         names = list(self.contract.action_names)
         cmd = JointCommand(
             name=names,
             position=[float(x) for x in vec],
             mode="position",
         )
-        if self.contract.emit_chunk_end and self._chunk_pending_end:
+        if self.contract.chunk_per_action or is_last or (
+            self.contract.emit_chunk_end and self._chunk_pending_end
+        ):
             cmd.effort = [CHUNK_END_SENTINEL] * len(names)
             self._chunk_pending_end = False
         self.node.send_output("action", cmd.to_arrow())
@@ -242,9 +280,18 @@ class PolicyRuntime:
         if self._sent == 1 or self._sent % 50 == 0:
             self._log(f"已发送 {self._sent} 个动作")
 
-    # 策略侧声明"当前 chunk 已发完"时置位，下一个动作（下一 chunk 的第一个）
-    # 之前的最后一个动作带哨兵。简化实现：由策略在 step 返回后调用。
     def mark_chunk_end(self) -> None:
+        """[DEPRECATED] 手工声明"上一个动作是 chunk 末动作"。
+
+        旧机制：置位后下一次发送附 effort 哨兵。只有在 step() **返回末动作
+        之前**调用才能得到正确语义（哨兵随末动作发出）；在返回后调用会把
+        哨兵错位到下一 chunk 的第一个动作——这正是本方法被替代的原因：
+        正确性完全依赖调用方手工把握时机。
+
+        新用法：chunk 制策略在 step() 里直接 `return (action, is_last)`，
+        runtime 自动在 is_last=True 的动作上打哨兵；每帧制策略在 contract
+        设 chunk_per_action=True。本方法仅为兼容保留，不再建议调用。
+        """
         self._chunk_pending_end = True
 
     # ---------------------------------------------------------------- run

@@ -101,7 +101,6 @@ def _make_contract():
 
 def _wire(policy, contract):
     runtime = PolicyRuntime(policy, contract)
-    policy.bind_runtime(runtime)
     return runtime
 
 
@@ -142,7 +141,7 @@ def test_chunk_rhythm_update_obs_every_frame():
 
 def test_chunk_end_sentinel_on_last_action_of_chunk():
     """哨兵必须随**本 chunk 末动作**发出：chunk 长度 3 → 第 3 个 action 带
-    effort 哨兵、前两个不带。这正是 SDK mark_chunk_end 语义的正确用法。"""
+    effort 哨兵、前两个不带。元组返回 (vec, is_last) 的接口保证用法。"""
     policy = _make_policy([[_mk_action() for _ in range(3)]])
     runtime = _wire(policy, _make_contract())
 

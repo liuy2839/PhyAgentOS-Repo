@@ -151,12 +151,18 @@ def main() -> int:
         modules = build_alg_modules(profile, log=lambda m: print(f"[rekep_policy] {m}", flush=True))
 
     use_dino = os.environ.get("REKEP_PERCEPTION", "scene_objects").lower() == "dino"
+    # 每帧制策略（每帧重新决策 = 官方 N=1 chunk）：每个动作都是决策单元的
+    # 末动作，必须带 effort 哨兵，评测端补查 is_episode_end() 的口径才与
+    # RoboDojo 官方 rollout 对齐（此前 emit_chunk_end=False，每 chunk 少一次
+    # 外层结束查询，成绩口径系统性偏低）。
     contract = PolicyContract(
         action_names=profile.action_names,
         cameras=tuple(args.cameras),
         depth_cameras=("depth/head",) if use_dino else (),
         scene_objects=bool(args.scene_objects),
         camera_info=use_dino,
+        emit_chunk_end=True,
+        chunk_per_action=True,
     )
     policy = ReKepPolicy(
         profile=profile,

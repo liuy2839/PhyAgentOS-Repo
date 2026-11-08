@@ -125,18 +125,27 @@ from forge_policy import Policy, PolicyContract, PolicyRuntime
 class MyPolicy(Policy):
     def reset_episode(self): ...          # episode 边界：清缓存 / 重置内部状态
     def set_instruction(self, text): ...  # 接收任务指令
-    def step(self, obs) -> np.ndarray | None: ...  # 一帧观测 → 一个动作
+    def step(self, obs): ...              # 见下方三种返回形态
     def shutdown(self): ...
 
 contract = PolicyContract(
     action_names=[...],          # 与 robodojo_env.action_component_names() 逐字一致（ARX X5 joint = 14 维）
     cameras=["image/head", "image/left_wrist", "image/right_wrist"],
-    emit_chunk_end=True,         # RoboDojo 必须开；哨兵要随「本 chunk 末动作」发出，
-                                 # 即在 step() 返回末动作之前调 mark_chunk_end()
+    emit_chunk_end=True,         # RoboDojo 必须开
+    # chunk_per_action=True,     # 每帧制策略（每帧重新决策 = N=1 chunk）加这行
 )
-runtime = PolicyRuntime(MyPolicy(), contract)
-policy.bind_runtime(runtime)     # 若 step 内需要 mark_chunk_end
-runtime.run()
+PolicyRuntime(MyPolicy(), contract).run()
+```
+
+`step()` 的返回形态（`emit_chunk_end=True` 时推荐元组形式，哨兵时机由接口
+保证，与 RoboDojo 官方「chunk 末动作之后、下一帧观测之前补查」的序列对齐）：
+
+```python
+def step(self, obs):
+    ...
+    return None                    # 本帧不动作（如规划中）
+    return vec                     # 裸向量：非 chunk 末（兼容旧用法）
+    return vec, True               # (向量, is_last)：runtime 自动给末动作附哨兵
 ```
 
 策略代码放进 `nodes/policies/<你的策略>/`，准备独立 Python 环境（与评测侧

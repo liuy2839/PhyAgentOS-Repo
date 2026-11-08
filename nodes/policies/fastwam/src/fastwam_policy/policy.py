@@ -182,13 +182,6 @@ class FastWAMPolicy(Policy):
         self._instruction = ""
         self._chunk: list[np.ndarray] = []
         self._chunk_pos = 0
-        # main() 在 run() 之前注入；bind 前就 step 是接线 bug，直接炸出来。
-        self._runtime: PolicyRuntime | None = None
-
-    def _require_runtime(self) -> PolicyRuntime:
-        if self._runtime is None:
-            raise RuntimeError("FastWAMPolicy.bind_runtime() 必须在 PolicyRuntime.run() 之前调用")
-        return self._runtime
 
     # ---- forge_policy.Policy 四方法 ----
 
@@ -202,7 +195,7 @@ class FastWAMPolicy(Policy):
         self._instruction = str(text)
         log(f"指令：{self._instruction}")
 
-    def step(self, obs: dict[str, Any]) -> np.ndarray | None:
+    def step(self, obs: dict[str, Any]) -> "np.ndarray | tuple[np.ndarray, bool] | None":
         # **先无条件 update_obs**（官方节奏坑 2：有策略吃历史帧，只在需要
         # 动作时喂会静默劣化），chunk 用尽才调 get_action 推新 chunk。
         model_obs = self._to_model_obs(obs)
@@ -217,11 +210,10 @@ class FastWAMPolicy(Policy):
         vec = self._chunk[self._chunk_pos]
         last = self._chunk_pos + 1 == len(self._chunk)
         self._chunk_pos += 1
-        if last:
-            # 哨兵随**本 chunk 末动作**发出 —— RoboDojo 的 is_episode_end()
-            # 带副作用，官方在 chunk 末动作之后、下一帧观测之前多查一次。
-            self._require_runtime().mark_chunk_end()
-        return vec
+        # 元组声明 is_last：runtime 自动给末动作附 effort 哨兵，评测端补查
+        # 那次 is_episode_end() 的时机与官方（chunk 末动作之后、下一帧观测
+        # 之前）逐字对齐——不再依赖手工 mark_chunk_end 的置位时机。
+        return vec, last
 
     # ---- 内部 ----
 
@@ -241,12 +233,6 @@ class FastWAMPolicy(Policy):
             "state": st,
         }
 
-    # ---- runtime 注入 ----
-
-    def bind_runtime(self, runtime: PolicyRuntime) -> None:
-        """PolicyRuntime 不回传引用，这里在构造后手工接线（main 里调用）。"""
-        self._runtime = runtime
-
 
 def _action_names(state_spec) -> tuple[str, ...]:
     return tuple(f"{key}.{i}" for key, dim in state_spec for i in range(dim))
@@ -265,7 +251,6 @@ def main() -> int:
     )
     policy = FastWAMPolicy(build_model(), arm_dims, ee_dims, action_type)
     runtime = PolicyRuntime(policy, contract)
-    policy.bind_runtime(runtime)
     obs_spec = policy._obs_spec
     log(f"动作 {contract.action_dim} 维 / 观测 {sum(d for _, d in obs_spec)} 维")
     return runtime.run()
