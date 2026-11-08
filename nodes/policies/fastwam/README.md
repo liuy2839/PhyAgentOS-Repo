@@ -26,14 +26,11 @@ chunk 末动作打标记               → step() 末动作后 mark_chunk_end()�
 
 **chunk_end 哨兵时机**（RoboDojo 成绩口径的关键）：RoboDojo 的
 `is_episode_end()` 有副作用，官方每 chunk 在末动作之后、下一帧观测之前多查
-一次。本节点 contract 开 `emit_chunk_end=True`，且 `mark_chunk_end()` 在
-`step()` 返回末动作**之前**调用——`PolicyRuntime._send_action` 发出的就是
-带着哨兵的末动作本身，评测端补查时机与官方一致。
-
-> 注：`PolicyRuntime.mark_chunk_end` 的 docstring 写的是"下一个动作（下一
-> chunk 的第一个）之前的最后一个动作"，其实现（置位后下一次发送打哨兵）只在
-> **step 返回末动作之前调用**才能得到该语义；在返回后调用会把哨兵错位到下一
-> chunk 首动作。本节点按正确时机调用；SDK 的 docstring 措辞问题本次不动。
+一次。本节点 `step()` 以元组 `return vec, is_last` 声明 chunk 边界——
+`PolicyRuntime` 自动给 `is_last=True` 的动作附 effort 哨兵，评测端补查时机
+与官方一致。**哨兵位置由接口保证**（元组跟着动作走），不再依赖手工置位的
+调用时机；SDK 的 `mark_chunk_end()` 已标 deprecated（保留兼容，勿在新代码
+使用——它在"step 返回后调用"的直觉用法下会把哨兵错位到下一 chunk 首动作）。
 
 ## 观测还原
 
