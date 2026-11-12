@@ -1,0 +1,16 @@
+[project]
+name = "forge-benchmark-robodojo-eval"
+version = "0.2.0"
+description = "RoboDojo 评测发起独立节点（协议层 + 批次调度 + 官方判分口径）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "dora-rs==0.4.1",
+    "numpy",
+    "pyarrow",
+    "pyyaml>=6.0",
+    "opencv-python",
+    # RoboDojo 与 Isaac Sim 由评测环境提供（RoboDojo conda env），不在此声明。
+]
+
+[tool.uv.sources]

@@ -1,0 +1,15 @@
+[project]
+name = "forge-policy-pi05"
+version = "0.1.0"
+description = "π0.5 策略节点：统一策略协议上的 openpi 适配（骨架，推理待算法方提供）"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "dora-rs==0.4.1",
+    "numpy",
+    "pyarrow",
+    "forge-policy",
+]
+
+[tool.uv.sources]
+forge-policy = { path = "../../../policy" }

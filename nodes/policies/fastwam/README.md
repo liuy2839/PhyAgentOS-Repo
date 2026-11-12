@@ -65,8 +65,8 @@ ACTION_TYPE=joint \
 
 dataflow 里 `policy_command` 输入必须 `queue_size: 32`
 （`forge_policy.contract.MIN_POLICY_COMMAND_QUEUE`：回合边界连发 4 条命令，
-默认深度会挤掉前面的且不报错）。完整两节点拓扑见
-`nodes/benchmarks/robodojo_eval/dataflow.yaml`。
+默认深度会挤掉前面的且不报错）。完整两节点拓扑见本目录的
+`dataflow.example.yaml`（策略侧资产；评测节点本身策略无关）。
 
 ## 单测
 
@@ -84,3 +84,7 @@ XPolicyLab（model 用替身、规格注入维度）。
   首次上机先跑 v2 文档第 6 节步 1 的对照回合。
 - 指令按轮传入：`set_instruction` 随时生效于下一次 chunk 推理；进程常驻，
   三轮 RSI 不重载权重。
+
+## 协议 v2（评测端两级握手）
+
+ready 时经 `runtime.set_handshake()` 上报契约自报（policy_id/action_type/weight_id/obs_state_dim）；reset_scene 后自动回 reset_ack；每帧观测随 obs_meta 带回合身份，动作经 action_meta 回带——异回合动作被评测端机械丢弃。字段表见 `policy/src/forge_policy/HANDSHAKE_FIELDS.md`。

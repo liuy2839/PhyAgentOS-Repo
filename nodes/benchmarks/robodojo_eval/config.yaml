@@ -8,7 +8,7 @@ benchmark: robodojo
 env_cfg_type: arx_x5      # ARX X5 双臂，对应 env_cfg/arx_x5.yml
 device_id: 0              # 进程可见的 GPU 序号（外面用 CUDA_VISIBLE_DEVICES 选卡）
 action_type: joint        # 必须与策略 deploy.yml 一致
-policy_id: FastWAM_80k_forge   # 仅用于官方配置组装与结果标注
+policy_id: auto   # 通用身份（《修改方案》）：对面是谁由握手自报，回合启动时覆盖此占位
 additional_info: forge
 seed: 0                   # 官方 eval_cfg["seed"]；布局 ID 在 eval_command 的 layout_id 里逐回合给
 
@@ -20,7 +20,26 @@ result_dir: ./rsi_results
 # 等 action 的看门狗周期（秒）
 watchdog_s: 20.0
 
+# 看门狗放弃上限（《修改方案》：等待超时进入明确终态）。
+# 同一序号累计等待超过 give_up_after_s，或重发观测超过 max_republishes 次，
+# 回合以 failed 终态（错误信息带证据）。0 = 不限（旧行为）。
+# pi05 冷启动加载 7-8 分钟 → 默认 900s。
+give_up_after_s: 900.0
+max_republishes: 30
+
+# 批次展开时每任务默认取的布局数（run 命令未给 init_state_ids 时的全集大小）。
+# RoboDojo 官方口径 50；正式评测写 50，冒烟可调小。
+init_states_per_task: 50
+
 camera_map:
   image/head: cam_head
   image/left_wrist: cam_left_wrist
   image/right_wrist: cam_right_wrist
+
+# 可选观测通道（默认全关）。ReKep 等 scene_objects 感知策略开
+# publish_scene_objects；depth 感知策略开 publish_camera_info（相机内/外参）。
+publish_scene_objects: false
+publish_camera_info: false
+
+# 步数预算兜底（实际以环境 step_lim 为准，reset 后自动修正）
+max_steps_default: 1050

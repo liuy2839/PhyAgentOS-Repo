@@ -1,17 +1,20 @@
-# FastWAM 三轮 RSI 的两节点评测闭环（接口①② 见 FastWAM_RSI_分工与接口_v2.md 第 3.2 节）
+# FastWAM 接入评测的 dataflow 示例（策略侧资产，放在策略目录下）。
 #
-# 跑：dora run dataflow.yaml
+# 评测节点（nodes/benchmarks/robodojo_eval）是**策略无关的**：换策略只改本
+# 文件的 policy 节点段（id/env/权重路径），评测节点代码与配置零改动。
+# 接口①② 见 FastWAM_RSI_分工与接口_v2.md 第 3.2 节。
+#
+# 跑：dora run dataflow.example.yaml
 #
 # 两个节点**必须用不同的 python**（与原 forge 流程同样的硬约束）：
 #   评测侧要 isaacsim 5.1（RoboDojo conda env，py3.10）
 #   策略侧要 FastWAM/XPOLICYLAB 依赖（独立 env）
-# 原 forge 流程的 gateway / bench_tool（forge-tool 工具面）已全部去掉 ——
-# 本 dataflow 只有数据平面，编排方（模块 D）经 eval_command 逐回合驱动。
+# 本 dataflow 只有数据平面，编排方经 eval_command 驱动（单回合或批次）。
 #
-# 拓扑：
+# 拓扑（dora 端口名是协议的一部分，任何策略侧都保持这些名字）：
 #   编排 ──eval_command──► robodojo_eval（Isaac Sim 数据面）
-#   robodojo_eval ──policy_command / proprio_state / image/*──► fastwam_policy
-#   fastwam_policy ──action──► robodojo_eval
+#   robodojo_eval ──policy_command / proprio_state / image/* / obs_meta──► fastwam_policy
+#   fastwam_policy ──action / action_meta / policy_status──► robodojo_eval
 #   robodojo_eval ──eval_status / eval_result──► 编排方订阅（或 dora 侧录文件）
 
 nodes:
@@ -34,14 +37,21 @@ nodes:
     inputs:
       eval_command: <ORCHESTRATOR>/eval_command
       action: fastwam_policy/action
+      action_meta: fastwam_policy/action_meta
+      policy_status: fastwam_policy/policy_status
     outputs:
       - proprio_state
       - image/head
       - image/left_wrist
       - image/right_wrist
+      - obs_meta
       - policy_command
       - eval_status
       - eval_result
+      # 可选观测通道（config.yaml 开 publish_* 后按需声明，FastWAM 不需要）：
+      # ReKep 等 scene_objects 感知策略要加 scene_objects（+ config 开
+      # publish_scene_objects）；depth 感知策略加 depth/* 与 camera_info。
+      # 参见 nodes/policies/rekep/dataflow.example.yaml。
 
   - id: fastwam_policy
     path: <FASTWAM_POLICY_ENV>/bin/python

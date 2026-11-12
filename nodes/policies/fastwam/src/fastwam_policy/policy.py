@@ -251,6 +251,14 @@ def main() -> int:
     )
     policy = FastWAMPolicy(build_model(), arm_dims, ee_dims, action_type)
     runtime = PolicyRuntime(policy, contract)
+    # 契约自报（协议 v2 握手）：随 ready 上报，评测端校验后启动回合。
+    runtime.set_handshake(
+        policy_id=os.environ.get("POLICY_NAME", "G05"),
+        action_type=action_type,
+        weight_id=os.environ.get("WEIGHT_ID"),
+        weight_sha256=os.environ.get("WEIGHT_SHA256"),
+        obs_state_dim=sum(d for _, d in policy._obs_spec),
+    )
     obs_spec = policy._obs_spec
     log(f"动作 {contract.action_dim} 维 / 观测 {sum(d for _, d in obs_spec)} 维")
     return runtime.run()

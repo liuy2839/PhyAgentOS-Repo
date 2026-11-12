@@ -31,8 +31,10 @@ class EvalNodeConfig:
     device_id: int = 0
     # 动作语义，必须与策略 deploy.yml 一致：joint → arm_joint_state；ee → ee_pose。
     action_type: str = "joint"
-    # 仅用于官方配置组装与结果标注（FastWAM_80k_forge / G05），动作实际从 dora 来。
-    policy_id: str = "FastWAM_80k_forge"
+    # 仅用于官方配置组装与结果标注的**通用身份**（《修改方案》：配置不含具体
+    # 策略名）。回合启动时若握手已有 policy_id 则以握手值覆盖——对面是谁由
+    # 策略自报，不由本配置预判。默认 "auto" 即"等握手"。
+    policy_id: str = "auto"
     additional_info: str = "forge"
     # 官方 eval_cfg["seed"]（影响过程随机化）；**不是布局 ID** —— 布局在
     # eval_command 的 layout_id 里逐回合指定。
@@ -48,8 +50,17 @@ class EvalNodeConfig:
     # 等 action 的看门狗周期（秒）。明显大于最慢策略的单步推理耗时
     # （G05/FastWAM 首帧秒级），又不至于把真死锁挂太久。
     watchdog_s: float = 20.0
+    # 看门狗放弃上限（《修改方案》：等待超时进入明确终态）。同一序号累计等待
+    # 超过 give_up_after_s，或重发观测超过 max_republishes 次 → 回合 failed
+    # 终态（区别于"推理慢"的无限耐心）。0 = 不限（旧行为）。
+    # pi05 冷启动加载权重 7.5-8 分钟 → 默认值必须远大于此，设 900s。
+    give_up_after_s: float = 900.0
+    max_republishes: int = 30
     # 环境不暴露 step_lim 时的兜底 horizon（RoboDojo 各任务自带，正常用不到）。
     max_steps_default: int = 1050
+    # 批次展开时每任务默认取的布局数（run 命令未给 init_state_ids 时的全集大小）。
+    # RoboDojo 官方口径是每任务 50 个布局；正式评测写 50，冒烟可以调小。
+    init_states_per_task: int = 50
 
 
 def load_config(path: str | Path) -> EvalNodeConfig:
@@ -75,7 +86,14 @@ def load_config(path: str | Path) -> EvalNodeConfig:
     cfg.watchdog_s = float(data.get("watchdog_s", cfg.watchdog_s))
     if cfg.watchdog_s <= 0:
         raise ValueError("watchdog_s 必须 > 0")
+    cfg.give_up_after_s = float(data.get("give_up_after_s", cfg.give_up_after_s))
+    cfg.max_republishes = int(data.get("max_republishes", cfg.max_republishes))
+    if cfg.max_republishes < 0 or cfg.give_up_after_s < 0:
+        raise ValueError("give_up_after_s / max_republishes 必须 ≥ 0（0 = 不限）")
     cfg.max_steps_default = int(data.get("max_steps_default", cfg.max_steps_default))
     if cfg.max_steps_default < 1:
         raise ValueError("max_steps_default 必须 ≥1")
+    cfg.init_states_per_task = int(data.get("init_states_per_task", cfg.init_states_per_task))
+    if cfg.init_states_per_task < 1:
+        raise ValueError("init_states_per_task 必须 ≥1")
     return cfg

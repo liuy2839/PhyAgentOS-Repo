@@ -452,6 +452,37 @@ class RoboDojoEpisodeEnv:
             self._env = None
             self._env_task_name = None
 
+    def native_result_path(self) -> str | None:
+        """官方 eval 链路的 _result.json 路径（判分的原始证据）。
+
+        RoboDojo 官方评测在 episode 结束时按 `eval_result/<benchmark>/<task>/
+        <policy>/` 落盘原生结果。路径规则以官方 eval_client 实现为准，这里只做
+        惰性探测（找不到就返回 None，不猜路径伪造证据）。
+        """
+        env = self._env
+        if env is None:
+            return None
+        task = self.tasks[0] if getattr(self, "tasks", None) else None
+        if not task:
+            return None
+        candidates = [
+            os.path.join("eval_result", self._benchmark, task, self.cfg.policy_id),
+            os.path.join("eval_result", self._benchmark, task),
+        ]
+        for base in candidates:
+            if not os.path.isdir(base):
+                continue
+            # 目录内最新的 _result.json
+            best = None
+            for name in os.listdir(base):
+                if name.endswith("_result.json"):
+                    path = os.path.join(base, name)
+                    if best is None or os.path.getmtime(path) > os.path.getmtime(best):
+                        best = path
+            if best is not None:
+                return os.path.abspath(best)
+        return None
+
     # ---- 观测转换 ----
 
     def to_state(self, obs: dict[str, Any]) -> np.ndarray:

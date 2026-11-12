@@ -95,6 +95,20 @@ class PolicyRuntime:
         self._chunk_pending_end = False
         self._failed = False
         self._sent = 0
+        # ---- 协议 v2（与评测节点 robodojo_eval/episode_service 对应）----
+        # 当前回合身份：评测端每帧观测随 obs_meta {episode_id, seq} 同拍发出，
+        # 动作经 action_meta 回带同标签——异回合动作被评测端机械丢弃。
+        self._episode_id: str | None = None
+        self._obs_seq: int | None = None
+        # ready 载荷的契约自报（评测端握手门禁的数据源）：由策略/入口在构造
+        # 后经 set_handshake() 填写；run() 开头随 ready 一次性上报。
+        self._handshake_payload: dict[str, Any] = {}
+
+    def set_handshake(self, **payload: Any) -> None:
+        """填写 ready 时的契约自报（policy_id/action_type/action_names/cameras/
+        weight_id/weight_sha256/est_startup_s/emit_chunk_end/chunk_per_action/
+        obs_state_dim——字段表见本目录 HANDSHAKE_FIELDS.md）。"""
+        self._handshake_payload.update(payload)
 
     # -------------------------------------------------------------- status
     def _emit_status(self, state: str, **extra: Any) -> None:
@@ -105,6 +119,19 @@ class PolicyRuntime:
             )
         except Exception as exc:  # 输出未在 dataflow 声明时忽略
             self._log(f"policy_status 输出不可用: {exc}")
+
+    def _emit_action_meta(self) -> None:
+        """随动作同拍发出身份标签（回带当前回合的 episode_id + seq）。"""
+        if self._episode_id is None:
+            return
+        try:
+            self.node.send_output(
+                "action_meta",
+                json.dumps({"episode_id": self._episode_id, "seq": self._obs_seq},
+                           ensure_ascii=False).encode("utf-8"),
+            )
+        except Exception as exc:  # 输出未在 dataflow 声明时忽略
+            self._log(f"action_meta 输出不可用: {exc}")
 
     # ------------------------------------------------------------ commands
     def _handle_command(self, cmd: PolicyCommand) -> bool:
@@ -143,9 +170,14 @@ class PolicyRuntime:
             self._last_complete_obs = None
             self._chunk_pending_end = False
             self._failed = False
+            self._episode_id = None          # 新回合：旧身份作废
+            self._obs_seq = None
             if self._phase == POLICY_STATUS_IDLE:
                 self._phase = POLICY_STATUS_READY
+            # reset 确认（协议 v2）：评测端收到才发首帧——观测先于 reset 被
+            # 消费/清空的乱序死锁从结构上消除（超时兜底在评测端）。
             self._emit_status(self._phase)
+            self._emit_status("reset_ack")
         elif command in ("pause", "resume"):
             # 协议预留：评测端当前不发，保持运行态切换语义。
             if command == "pause":
@@ -253,7 +285,6 @@ class PolicyRuntime:
             )
             return
         self._send_action(vec, is_last=is_last)
-
     def _send_action(self, vec: np.ndarray, is_last: bool = False) -> None:
         """发送动作；按三优先级决定是否附 effort 哨兵：
 
@@ -276,6 +307,9 @@ class PolicyRuntime:
             cmd.effort = [CHUNK_END_SENTINEL] * len(names)
             self._chunk_pending_end = False
         self.node.send_output("action", cmd.to_arrow())
+        # 身份标签随动作同拍发出（协议 v2）：评测端按 episode_id 校验，异回合
+        # 动作机械丢弃。动作消息本身是固定 Arrow 格式不能内嵌，走独立 JSON 通道。
+        self._emit_action_meta()
         self._sent += 1
         if self._sent == 1 or self._sent % 50 == 0:
             self._log(f"已发送 {self._sent} 个动作")
@@ -296,6 +330,16 @@ class PolicyRuntime:
 
     # ---------------------------------------------------------------- run
     def run(self) -> int:
+        # ready + 契约自报（协议 v2）：评测端握手门禁的数据源。policy_id 等
+        # 由 set_handshake() 填写；contract 的字段作为默认兜底。
+        ready_payload: dict[str, Any] = {
+            "action_names": list(self.contract.action_names),
+            "cameras": list(self.contract.cameras),
+            "emit_chunk_end": self.contract.emit_chunk_end,
+            "chunk_per_action": self.contract.chunk_per_action,
+            **self._handshake_payload,
+        }
+        self._emit_status("ready", **ready_payload)
         self._emit_status(POLICY_STATUS_IDLE)
         self._log(
             f"就绪：动作 {self.contract.action_dim} 维 "
@@ -314,6 +358,16 @@ class PolicyRuntime:
                     cmd = PolicyCommand.from_arrow(event["value"])
                     if not self._handle_command(cmd):
                         break
+                    continue
+                if eid == "obs_meta":
+                    # 观测身份标签（协议 v2）：记录当前回合的 episode_id + seq，
+                    # 下一个动作经 action_meta 回带——异回合动作被评测端丢弃。
+                    try:
+                        meta = json.loads(_payload_text(event["value"]))
+                        self._episode_id = meta.get("episode_id")
+                        self._obs_seq = meta.get("seq")
+                    except Exception as exc:  # noqa: BLE001
+                        self._log(f"obs_meta 解析失败: {exc}")
                     continue
                 if eid == "proprio_state":
                     state = JointState.from_arrow(event["value"])

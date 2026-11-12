@@ -437,3 +437,102 @@ def test_camera_info_frame_and_obs_field() -> None:
 
 def _unused(*_: Any) -> None:  # pragma: no cover
     _ = SimpleNamespace, ModuleType
+
+
+# ---------------------------------------------------------------- 协议 v2
+
+
+class _ReadyPolicy(Policy):
+    """最小策略：按脚本回放动作 (ndarray, is_last)。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.resets = 0
+
+    def reset_episode(self):
+        self.resets += 1
+
+    def set_instruction(self, text):
+        pass
+
+    def step(self, obs):
+        if not self.script:
+            return None
+        return self.script.pop(0)
+
+    def shutdown(self):
+        pass
+
+
+def _make_runtime(tmp_path: Path, script, **contract_kw):
+    """协议 v2 测试的 runtime 构造（FakeNode + _ReadyPolicy）。"""
+    policy = _ReadyPolicy(script)
+    contract = PolicyContract(
+        action_names=("j1", "j2"), cameras=("image/head",), emit_chunk_end=True,
+        **contract_kw,
+    )
+    runtime = PolicyRuntime(policy, contract, node=FakeNode(events=[]),
+                            logger=lambda m: None)
+    return runtime, policy
+
+
+def _obs_events() -> list[dict[str, Any]]:
+    """一帧完整观测 + 先行的 obs_meta（协议 v2）。"""
+    import numpy as np
+
+    from forge_policy.msgs import Image, JointState
+
+    state = JointState(name=["j1", "j2"], position=[0.0, 0.0])
+    img = Image.from_numpy(np.zeros((2, 2, 3), dtype=np.uint8), "rgb8")
+    meta = {"type": "INPUT", "id": "obs_meta",
+            "value": pa.array([json.dumps({"episode_id": "ep-001", "seq": 0})])}
+    return [meta,
+            {"type": "INPUT", "id": "proprio_state", "value": state.to_arrow()},
+            {"type": "INPUT", "id": "image/head", "value": img.to_arrow()}]
+
+
+def test_ready_emits_handshake_payload(tmp_path: Path):
+    """run() 开头：ready + 契约自报（set_handshake 的字段全部带上）。"""
+    runtime, _ = _make_runtime(tmp_path, [])
+    runtime.set_handshake(policy_id="fastwam-test", action_type="joint",
+                          weight_id="w1", obs_state_dim=28)
+    runtime.node.events = [{"type": "STOP"}]
+    runtime.run()
+    sent = [json.loads(v) for oid, v in runtime.node.outputs if oid == "policy_status"]
+    ready = [s for s in sent if s.get("status") == "ready"][-1]
+    assert ready["policy_id"] == "fastwam-test"
+    assert ready["action_names"] == ["j1", "j2"]
+    assert ready["weight_id"] == "w1"
+    assert ready["obs_state_dim"] == 28
+    assert ready["emit_chunk_end"] is True
+
+
+def test_reset_ack_sent_after_reset_scene(tmp_path: Path):
+    runtime, _ = _make_runtime(tmp_path, [])
+    runtime.node.events = [_pc_event("reset_scene"), {"type": "STOP"}]
+    runtime.run()
+    sent = [json.loads(v) for oid, v in runtime.node.outputs if oid == "policy_status"]
+    assert sent[-1]["status"] == "reset_ack"
+    # reset_ack 之前有相位状态（ready/idle）
+    assert any(s.get("status") in ("ready", "idle") for s in sent[:-1])
+
+
+def test_action_meta_carries_episode_identity(tmp_path: Path):
+    """obs_meta 记录回合身份 → 动作后 action_meta 回带同标签。"""
+    import numpy as np
+
+    runtime, _ = _make_runtime(
+        tmp_path, [(np.zeros(2, dtype=np.float64), True)])
+    runtime.node.events = (
+        [_pc_event("start")] + _obs_events() + [{"type": "STOP"}]
+    )
+    runtime.run()
+    metas = [json.loads(v) for oid, v in runtime.node.outputs if oid == "action_meta"]
+    assert metas == [{"episode_id": "ep-001", "seq": 0}]
+    actions = [(oid, v) for oid, v in runtime.node.outputs if oid == "action"]
+    assert len(actions) == 1
+    # 末动作带 effort 哨兵（chunk 长度 1 → 唯一动作即末动作）
+    from forge_policy.msgs import JointCommand
+
+    jc = JointCommand.from_arrow(actions[0][1])
+    assert jc.effort and jc.effort[0] == CHUNK_END_SENTINEL
