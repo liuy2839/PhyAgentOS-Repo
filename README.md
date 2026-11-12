@@ -44,8 +44,7 @@ nodes/benchmarks/robodojo_eval/    评测发起独立节点（模块 A，自包�
 ├── messages.py / config.py / config.yaml
 └── tests/                         状态机/协议/批次/消息 wire/录像单测
 nodes/policies/fastwam/            FastWAM 策略独立节点（模块 B）
-├── src/fastwam_policy/policy.py   FastWAMPolicy 四方法 + XPolicyLab 加载器
-│                                  （POLICY_NAME 切 FastWAM_80k_forge / G05）
+├── src/fastwam_policy/policy.py   四方法 + XPolicyLab 加载器（env POLICY_NAME 切模型）
 └── tests/                         chunk 节奏 / 哨兵时机 / 观测还原单测
 nodes/policies/rekep/              ReKep 策略节点（每帧制示例：chunk_per_action）
 nodes/policies/pi05/               π0.5 策略节点（WS 客户端 + 本地服务器架构，
