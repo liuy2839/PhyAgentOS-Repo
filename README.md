@@ -1,13 +1,14 @@
 # RoboDojo 评测独立节点
 
 本仓库发布 **RoboDojo 操作策略评测的两个独立标准 dora 节点**：
-评测发起节点（robodojo_eval）+ 策略节点（fastwam_policy / rekep_policy），
-以及它们共用的策略侧 SDK（forge_policy）。
+评测发起节点（robodojo_eval）+ 策略节点（fastwam_policy / rekep_policy /
+pi05_policy），以及它们共用的策略侧 SDK（forge_policy）。
 
 - 评测环境：RoboDojo（Isaac Sim 仿真，ARX X5 双臂）
 - 执行框架：dora 数据流（数据平面节点，观测→动作 1:1 锁步）
-- 驱动方式：编排方（如三轮 RSI 编排）经 `eval_command` JSON 通道逐回合驱动，
-  接口见 `FastWAM_RSI_分工与接口_v2.md` 第 3.2 节
+- 驱动方式：编排层经 `eval_command` JSON 通道驱动——单回合（接口①）或
+  批次（run 命令，节点内展开汇总）；接口见 `FastWAM_RSI_分工与接口_v2.md`
+- Skill profile（策略×环境的组合配置单）归控制层仓库维护，不在本仓库
 
 > 历史注：本仓库此前包含完整 PAOS 评测流程（gateway + bench_tool 工具面 +
 > `_core` 批次调度 + Skill Bundle 打包）。为避免与 agent 层重构产生绑定，
@@ -35,21 +36,26 @@ robodojo_eval ──eval_status / eval_result──► 编排方订阅（接口�
 ```
 nodes/benchmarks/robodojo_eval/    评测发起独立节点（模块 A，自包含）
 ├── main.py                        入口（Isaac Sim 启动 + 事件循环）
-├── episode_service.py             单回合状态机（eval_command 驱动，纯逻辑可单测）
+├── episode_service.py             单回合状态机 + 批次驱动（纯逻辑可单测）
+├── handshake.py                   环境契约声明 + 策略握手校验（协议层）
+├── batch.py                       批次展开/参数校验/汇总（评测调度）
 ├── robodojo_env.py                RoboDojo 官方 env 封装（防坑口径逐字保留）
 ├── episode_recorder.py            逐相机录像（每路相机一个 mp4）
 ├── messages.py / config.py / config.yaml
-├── dataflow.yaml                  与 fastwam_policy 的两节点拓扑
-└── tests/                         状态机 / 消息 wire / 录像单测
+│                                  （本目录策略无关：接入 dataflow 在各策略目录）
+└── tests/                         状态机/协议/批次/消息 wire/录像单测
 nodes/policies/fastwam/            FastWAM 策略独立节点（模块 B）
 ├── src/fastwam_policy/policy.py   FastWAMPolicy 四方法 + XPolicyLab 加载器
 │                                  （POLICY_NAME 切 FastWAM_80k_forge / G05）
 └── tests/                         chunk 节奏 / 哨兵时机 / 观测还原单测
-nodes/policies/rekep/              ReKep 策略节点（SDK 路径的另一示例）
+nodes/policies/rekep/              ReKep 策略节点（每帧制示例：chunk_per_action）
+nodes/policies/pi05/               π0.5 策略节点（WS 客户端 + 本地服务器架构，
+│                                  pro5000 冒烟通过：50 步 chunk / 首帧 14.1s）
 policy/                            策略侧 SDK：forge_policy
 ├── src/forge_policy/base.py       Policy 四方法抽象（reset_episode/set_instruction/step/shutdown）
 ├── src/forge_policy/contract.py   策略线协议（PolicyContract：观测 topic、动作分量、哨兵）
 ├── src/forge_policy/runtime.py    PolicyRuntime：帧聚合、命令分发、动作发送、状态上报
+├── src/forge_policy/HANDSHAKE_FIELDS.md 握手契约字段表（协议规范，随 SDK）
 └── tests/                         协议与生命周期单测
 scripts/deploy_rekep_policy.sh     策略侧部署（rsync + venv + 冒烟）
 ```
@@ -81,8 +87,35 @@ scripts/deploy_rekep_policy.sh     策略侧部署（rsync + venv + 冒烟）
 ```
 
 回合边界的 policy_command 序列：`start` → `set_instruction`(占位) →
-`reset_scene` → `set_instruction`(最终)。dataflow 里 `policy_command` 必须
-`queue_size: 32`（forge_policy contract 最低要求）。
+`reset_scene` → **等策略 reset_ack**（policy_status 通道，超时 5s 兜底）→
+`set_instruction`(最终) → 首帧（带 obs_meta：episode_id + seq；动作须回带
+同回合身份）。**握手两级校验**：启动期快检（静态快照挡明显错配）+ env 建好
+后的**活终检**（对照 `env.action_component_names()` 活推导逐字比对，机器人
+换代零代码改动）。运行中协议：策略 failed 上报 → 回合立即 failed；看门狗放弃
+上限（give_up_after_s / max_republishes）→ failed 带证据；stop **关闭动作
+入口**（迟到动作从状态上不可消费）；结果含实际生效参数与官方原生
+_result.json 路径，原子写入唯一回合目录。
+**策略身份通用化**：配置的 `policy_id` 是占位（默认 `auto`），启动时被握手
+自报覆盖——官方组装、打标、结果标注以策略自报为准。
+dataflow 里 `policy_command` 必须 `queue_size: 32`（forge_policy contract
+最低要求）。
+
+### 查询（describe / status）
+
+`eval_command` 另支持 `{"command": "describe"}`（能力快照：环境契约、任务
+清单、动作空间集合、当前策略身份）与 `{"command": "status"}`（回合/批次
+进度、动作入口状态），应答经 `eval_status`。
+
+### 批次（run 命令，节点内展开汇总）
+
+```json
+{"command": "run", "suite": "arrange_largest_number", "task_ids": null,
+ "init_state_ids": [0, 1], "num_runs": 2, "max_steps": null, "seed": 0}
+```
+
+节点内展开成回合队列逐回合执行，结束发 `eval_result`（kind=batch：总
+success_rate + per_task 明细）并落盘 `batch_result_<batch_id>.json`。
+`task_ids=null` 跑全部、`[]` 报错（benchmark-plan 约定）。
 
 ## 启动
 

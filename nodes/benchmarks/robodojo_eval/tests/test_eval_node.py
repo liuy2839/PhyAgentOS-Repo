@@ -136,11 +136,29 @@ CAMERA_MAP = {
     "image/right_wrist": "cam_right_wrist",
 }
 OBS_SPEC = (("arm_joint_state", 6), ("ee_joint_state", 1), ("ee_pose", 7))
-ACTION_NAMES = (
-    [f"arm_joint_state.{i}" for i in range(6)]
-    + ["ee_joint_state.0"]
-    + [f"ee_pose.{i}" for i in range(7)]
-)
+# 动作分量名与真 arx_x5 joint 模板一致（handshake.ACTION_SPACE_TEMPLATES["joint"]
+# 展开）——活校验（check_handshake_live）要求测试替身与真环境同形，否则合法
+# 握手会被活终检拒绝。
+import sys as _sys
+
+_HANDSHAKE_MOD = None
+
+
+def _action_names():
+    global _HANDSHAKE_MOD
+    if _HANDSHAKE_MOD is None:
+        import importlib.util as _iu
+
+        _spec = _iu.spec_from_file_location(
+            "hs_mod", Path(__file__).resolve().parent.parent / "handshake.py"
+        )
+        _HANDSHAKE_MOD = _iu.module_from_spec(_spec)
+        _sys.modules["hs_mod"] = _HANDSHAKE_MOD
+        _spec.loader.exec_module(_HANDSHAKE_MOD)
+    return _HANDSHAKE_MOD.action_space_names("joint")
+
+
+ACTION_NAMES = _action_names()
 
 
 class FakeNode:
@@ -291,6 +309,22 @@ def _load_local(alias: str, filename: str):
 _CONFIG = _load_local("robodojo_eval_config_alias", "config.py")
 _RECORDER = _load_local("robodojo_eval_recorder_alias", "episode_recorder.py")
 _SERVICE = _load_local("robodojo_eval_service_alias", "episode_service.py")
+_HANDSHAKE = _load_local("robodojo_eval_handshake_alias", "handshake.py")
+
+
+def _ready_payload(**overrides):
+    """合法的 ready 自报载荷（joint 空间，与 handshake 模板逐字一致）。"""
+    payload = {
+        "status": "ready",
+        "policy_id": "FastWAM_80k_forge",
+        "action_type": "joint",
+        "action_names": _HANDSHAKE.action_space_names("joint"),
+        "cameras": list(CAMERA_MAP),
+        "emit_chunk_end": True,
+        "weight_id": "fastwam-80k-test",
+    }
+    payload.update(overrides)
+    return payload
 
 
 @pytest.fixture
@@ -310,24 +344,39 @@ def env():
     return FakeEnv()
 
 
-def _feed_event(node, eid, payload):
-    return node._driver_ref.process_event({"type": "INPUT", "id": eid, "value": payload}) \
-        if hasattr(node, "_driver_ref") else None
+def _handshake(driver, **overrides):
+    """预置握手：喂一条合法 ready，之后的 start_episode 才会被接受。"""
+    driver.process_event({
+        "type": "INPUT", "id": "policy_status",
+        "value": pa.array([json.dumps(_ready_payload(**overrides))]),
+    })
+
+
+def _reset_ack(driver):
+    """喂一条 reset 确认，触发暂存首帧的发布。"""
+    driver.process_event({
+        "type": "INPUT", "id": "policy_status",
+        "value": pa.array([json.dumps({"status": "reset_ack"})]),
+    })
+
+
+def _start_episode(driver, **cmd_overrides):
+    """握手 + start + reset_ack 的完整启动序列（返回启动后的首帧是否已发布）。"""
+    _handshake(driver)
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({"command": "start_episode", **cmd_overrides})]),
+    })
+    _reset_ack(driver)
 
 
 def test_start_publishes_obs_and_instruction(cfg, node, env, monkeypatch):
-    """start 命令序列完整：start → set_instruction → reset_scene → set_instruction。"""
+    """start 命令序列完整：start → set_instruction → reset_scene → set_instruction → reset_ack → 首帧。"""
     monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
     driver = _make_driver(cfg, node, env)
 
-    driver.process_event({
-        "type": "INPUT", "id": "eval_command",
-        "value": pa.array([json.dumps({
-            "command": "start_episode", "task": "arrange_largest_number",
-            "layout_id": 0, "round": 1,
-            "instruction": "Arrange the numbers",
-        })]),
-    })
+    _start_episode(driver, task="arrange_largest_number", layout_id=0, round=1,
+                   instruction="Arrange the numbers")
     assert env.reset_calls == [("arrange_largest_number", 0)]
 
     status = node.jsons("eval_status")[0]
@@ -357,15 +406,8 @@ def test_full_episode_success_and_result_payload(cfg, node, env, monkeypatch):
     monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
     driver = _make_driver(cfg, node, env)
 
-    driver.process_event({
-        "type": "INPUT", "id": "eval_command",
-        "value": pa.array([json.dumps({
-            "command": "start_episode", "task": "classify_objects",
-            "layout_id": 3, "round": 2,
-            "instruction": "classify",
-            "output_dir": os.path.join(cfg.result_dir, "runA"),
-        })]),
-    })
+    _start_episode(driver, task="classify_objects", layout_id=3, round=2,
+                   instruction="classify", output_dir=os.path.join(cfg.result_dir, "runA"))
 
     from types import SimpleNamespace
 
@@ -412,10 +454,7 @@ def test_chunk_end_sentinel_on_last_action_of_chunk(cfg, node, env, monkeypatch)
     """末动作 effort 哨兵 → env.step(chunk_end=True)，其余 False。"""
     monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
     driver = _make_driver(cfg, node, env)
-    driver.process_event({
-        "type": "INPUT", "id": "eval_command",
-        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "layout_id": 0})]),
-    })
+    _start_episode(driver, task="t", layout_id=0)
 
     from types import SimpleNamespace
 
@@ -440,10 +479,7 @@ def test_chunk_end_sentinel_on_last_action_of_chunk(cfg, node, env, monkeypatch)
 def test_action_name_mismatch_fails_episode(cfg, node, env, monkeypatch):
     monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
     driver = _make_driver(cfg, node, env)
-    driver.process_event({
-        "type": "INPUT", "id": "eval_command",
-        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "layout_id": 0})]),
-    })
+    _start_episode(driver, task="t", layout_id=0)
     bad = [f"wrong.{i}" for i in range(len(ACTION_NAMES))]
     driver.process_event({
         "type": "INPUT", "id": "action",
@@ -475,10 +511,7 @@ def test_seed_layout_conflict_rejected(cfg, node, env, monkeypatch):
 def test_seed_as_layout_alias(cfg, node, env, monkeypatch):
     monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
     driver = _make_driver(cfg, node, env)
-    driver.process_event({
-        "type": "INPUT", "id": "eval_command",
-        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "seed": 4})]),
-    })
+    _start_episode(driver, task="t", seed=4)
     assert env.reset_calls == [("t", 4)]
     driver.close()
 
@@ -486,14 +519,8 @@ def test_seed_as_layout_alias(cfg, node, env, monkeypatch):
 def test_busy_when_episode_running(cfg, node, env, monkeypatch):
     monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
     driver = _make_driver(cfg, node, env)
-    driver.process_event({
-        "type": "INPUT", "id": "eval_command",
-        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "layout_id": 0})]),
-    })
-    driver.process_event({
-        "type": "INPUT", "id": "eval_command",
-        "value": pa.array([json.dumps({"command": "start_episode", "task": "u", "layout_id": 1})]),
-    })
+    _start_episode(driver, task="t", layout_id=0)
+    _start_episode(driver, task="u", layout_id=1)
     st = node.jsons("eval_status")[-1]
     assert st["command"] == "busy"
     assert env.reset_calls == [("t", 0)]
@@ -503,10 +530,7 @@ def test_busy_when_episode_running(cfg, node, env, monkeypatch):
 def test_timeout_republishes_obs(cfg, node, env, monkeypatch):
     monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
     driver = _make_driver(cfg, node, env)
-    driver.process_event({
-        "type": "INPUT", "id": "eval_command",
-        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "layout_id": 0})]),
-    })
+    _start_episode(driver, task="t", layout_id=0)
     n_img = [c for c, _ in node.sent].count("image/head")
     # 真实 dora 的 ERROR 超时事件到来时，20s 真的过去了；测试里把发帧时间回拨
     driver.episode.obs_sent_at -= driver.cfg.watchdog_s + 1.0
@@ -518,10 +542,7 @@ def test_timeout_republishes_obs(cfg, node, env, monkeypatch):
 def test_stop_command_finalizes(cfg, node, env, monkeypatch):
     monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
     driver = _make_driver(cfg, node, env)
-    driver.process_event({
-        "type": "INPUT", "id": "eval_command",
-        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "layout_id": 0})]),
-    })
+    _start_episode(driver, task="t", layout_id=0)
     driver.process_event({
         "type": "INPUT", "id": "eval_command",
         "value": pa.array([json.dumps({"command": "stop", "reason": "编排要求"})]),
@@ -536,10 +557,7 @@ def test_late_actions_after_finish_are_dropped(cfg, node, env, monkeypatch):
     """终局后迟到的动作必须丢弃（chunk 余下动作还在 dora 队列里）。"""
     monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
     driver = _make_driver(cfg, node, env)
-    driver.process_event({
-        "type": "INPUT", "id": "eval_command",
-        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "layout_id": 0})]),
-    })
+    _start_episode(driver, task="t", layout_id=0)
     from types import SimpleNamespace
 
     env.script([SimpleNamespace(obs=_mk_obs(), done=True, success=True, score=1.0, metrics={})])
@@ -560,13 +578,9 @@ def test_late_actions_after_finish_are_dropped(cfg, node, env, monkeypatch):
 
 
 def test_max_steps_timeout(cfg, node, env, monkeypatch):
-    """step_lim 之内不结束 → timed_out 收尾，status 仍是 succeeded。"""
     monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
     driver = _make_driver(cfg, node, env)
-    driver.process_event({
-        "type": "INPUT", "id": "eval_command",
-        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "layout_id": 0})]),
-    })
+    _start_episode(driver, task="t", layout_id=0)
 
     def mk_action(last=False):
         effort = [1.0] * len(ACTION_NAMES) if last else []
@@ -583,4 +597,334 @@ def test_max_steps_timeout(cfg, node, env, monkeypatch):
     assert r["termination"] == "timed_out"
     assert r["status"] == "succeeded"
     assert r["success"] is False
+    driver.close()
+
+
+# ---------------------------------------------------------------- 协议层专项
+
+
+def test_start_rejected_without_handshake(cfg, node, env, monkeypatch):
+    """没握手就发 start → 拒绝启动（校验契约与 ready 后才启动回合）。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "layout_id": 0})]),
+    })
+    st = node.jsons("eval_status")[-1]
+    assert st["command"] == "rejected"
+    assert "握手" in st["error"]
+    assert env.reset_calls == []
+    driver.close()
+
+
+def test_handshake_bad_action_names_rejected(cfg, node, env, monkeypatch):
+    """契约自报的分量名与环境模板不一致 → 握手失败 → start 被拒。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _handshake(driver, action_names=[f"wrong.{i}" for i in range(14)])
+    # 手工序列：不能再调 _start_episode（它会用合法 ready 覆盖坏握手）
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "layout_id": 0})]),
+    })
+    st = node.jsons("eval_status")[-1]
+    assert st["command"] == "rejected"
+    assert any("action_names" in e for e in st.get("handshake_errors", []))
+    driver.close()
+
+
+def test_handshake_ee_space_accepted(cfg, node, env, monkeypatch):
+    """ee 空间（ReKep 形状）在环境接受的集合内 → 握手通过。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _handshake(driver, action_type="ee",
+               action_names=_HANDSHAKE.action_space_names("ee"))
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "layout_id": 0})]),
+    })
+    _reset_ack(driver)
+    # 拒绝列表里没有它（env 是 joint 的 FakeEnv，但握手只校验契约层面）
+    sts = [s for s in node.jsons("eval_status") if s.get("command") == "rejected"]
+    assert sts == []
+    driver.close()
+
+
+def test_policy_failed_ends_episode(cfg, node, env, monkeypatch):
+    """策略上报 failed → 回合立即 failed 终态（不再等一个死掉的策略）。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _start_episode(driver, task="t", layout_id=0)
+    driver.process_event({
+        "type": "INPUT", "id": "policy_status",
+        "value": pa.array([json.dumps({
+            "status": "failed", "error_code": "cuda_oom", "message": "OOM on layer 12",
+        })]),
+    })
+    r = node.jsons("eval_result")[0]
+    assert r["status"] == "failed"
+    assert r["error_code"] == "policy_failed"
+    assert "cuda_oom" in r["error_message"]
+    driver.close()
+
+
+def test_reset_ack_gates_first_frame(cfg, node, env, monkeypatch):
+    """reset_ack 之前不发首帧；ack 到达立即发布。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _handshake(driver)
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({"command": "start_episode", "task": "t", "layout_id": 0})]),
+    })
+    assert [c for c, _ in node.sent].count("proprio_state") == 0      # 还没发
+    _reset_ack(driver)
+    assert [c for c, _ in node.sent].count("proprio_state") == 1      # ack 即发
+    # obs_meta 与首帧同拍
+    metas = node.jsons("obs_meta")
+    assert metas and metas[0]["seq"] == 0 and "episode_id" in metas[0]
+    driver.close()
+
+
+def test_obs_meta_seq_advances(cfg, node, env, monkeypatch):
+    """每帧观测带递增 seq；动作回带 episode_id 校验。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _start_episode(driver, task="t", layout_id=0)
+    from types import SimpleNamespace
+
+    env.script([SimpleNamespace(obs=_mk_obs(), done=False, success=False, score=None, metrics={})
+                for _ in range(2)])
+
+    def mk_action():
+        return messages.JointCommand(
+            name=list(ACTION_NAMES), mode="position", position=[0.0] * len(ACTION_NAMES),
+        ).to_arrow()
+
+    ep_id = node.jsons("obs_meta")[0]["episode_id"]
+    driver.process_event({"type": "INPUT", "id": "action", "value": mk_action()})
+    driver.process_event({"type": "INPUT", "id": "action", "value": mk_action()})
+    seqs = [m["seq"] for m in node.jsons("obs_meta")]
+    assert seqs == [0, 1, 2]      # 首帧 + 两次 step 后的两帧
+    assert driver.episode.episode_id == ep_id
+    driver.close()
+
+
+def test_mismatched_episode_action_dropped(cfg, node, env, monkeypatch):
+    """异回合动作（meta.episode_id 不符）→ 机械丢弃，不推进 env。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _start_episode(driver, task="t", layout_id=0)
+    mk = lambda: messages.JointCommand(
+        name=list(ACTION_NAMES), mode="position", position=[0.0] * len(ACTION_NAMES),
+    ).to_arrow()
+    # 带着旧回合身份的动作
+    driver.process_event({"type": "INPUT", "id": "action", "value": mk()})
+    before = len(env.step_calls)
+    driver._last_action_meta = {"episode_id": "old-episode"}
+    driver.on_action(mk(), meta={"episode_id": "old-episode"})
+    assert len(env.step_calls) == before
+    assert driver.episode.dropped_actions == 1
+    driver.close()
+
+
+def test_watchdog_gives_up(cfg, node, env, monkeypatch):
+    """重发次数达上限 → 回合 failed，错误信息带证据（等了多久/重发几次/seq）。"""
+    c = _CONFIG.EvalNodeConfig(result_dir=str(cfg.result_dir), max_republishes=2,
+                               give_up_after_s=0)
+    os.makedirs(c.result_dir, exist_ok=True)
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(c, node, env)
+    _start_episode(driver, task="t", layout_id=0)
+    # 三次超时：第 1、2 次重发，第 3 次触发放弃
+    for _ in range(3):
+        driver.episode.obs_sent_at -= c.watchdog_s + 1.0
+        driver.process_event({"type": "ERROR", "error": "Timeout event stream error: Receiver timed out"})
+    r = node.jsons("eval_result")[0]
+    assert r["status"] == "failed"
+    assert r["error_code"] == "policy_wait_timeout"
+    assert "重发观测 2 次" in r["error_message"] and "seq=0" in r["error_message"]
+    driver.close()
+
+
+# ---------------------------------------------------------------- 批次层端到端
+
+
+def test_batch_runs_all_episodes_and_summarizes(cfg, node, env, monkeypatch):
+    """run 命令 → 展开 2 回合 → 逐回合跑完 → 批次汇总发出并落盘。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    c = _CONFIG.EvalNodeConfig(result_dir=cfg.result_dir, init_states_per_task=2)
+    driver = _make_driver(c, node, env)
+    _handshake(driver)
+
+    from types import SimpleNamespace
+
+    def mk_action(last=False):
+        effort = [1.0] * len(ACTION_NAMES) if last else []
+        return messages.JointCommand(
+            name=list(ACTION_NAMES), mode="position", position=[0.0] * len(ACTION_NAMES),
+            effort=effort,
+        ).to_arrow()
+
+    # 每回合推 1 步就成功结束
+    env.script([SimpleNamespace(obs=_mk_obs(), done=True, success=True, score=1.0, metrics={})])
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({
+            "command": "run", "suite": "arrange_largest_number",
+            "num_runs": 2, "init_state_ids": [0, 1],
+            "output_dir": os.path.join(cfg.result_dir, "batchout"),
+        })]),
+    })
+    # run 命令展开 2 布局 × 2 次 = 4 个回合；逐回合喂 ack + 一步成功的动作。
+    # 每回合开始前重置 env 脚本（脚本耗尽后 FakeEnv 会永不结束）。
+    for _ in range(4):
+        _reset_ack(driver)
+        env.script([SimpleNamespace(obs=_mk_obs(), done=True, success=True, score=1.0, metrics={})])
+        driver.process_event({"type": "INPUT", "id": "action", "value": mk_action(last=True)})
+
+    batch_results = [r for r in node.jsons("eval_result") if r.get("kind") == "batch"]
+    assert len(batch_results) == 1
+    br = batch_results[0]
+    assert br["total_episodes"] == 4 and br["completed_episodes"] == 4
+    assert br["success_rate"] == 1.0
+    assert br["per_task"]["arrange_largest_number"]["successes"] == 4
+    assert br["batch_result_json"] and os.path.isfile(br["batch_result_json"])
+    # 每回合的 episode_result 也都发出过
+    ep_results = [r for r in node.jsons("eval_result") if r.get("kind") is None]
+    assert len(ep_results) == 4
+    driver.close()
+
+
+def test_batch_rejects_empty_task_ids(cfg, node, env, monkeypatch):
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _handshake(driver)
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({
+            "command": "run", "suite": "arrange_largest_number", "task_ids": [],
+        })]),
+    })
+    st = node.jsons("eval_status")[-1]
+    assert st["command"] == "rejected"
+    assert driver.batch is None
+    driver.close()
+
+
+# ---------------------------------------------------------------- 工具接口与入口关闭
+
+
+def test_admission_closed_after_stop_drops_late_actions(cfg, node, env, monkeypatch):
+    """stop 后动作入口关死：迟到动作被拒并计数；新 start 重开入口。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _start_episode(driver, task="t", layout_id=0)
+
+    def mk_action():
+        return messages.JointCommand(
+            name=list(ACTION_NAMES), mode="position", position=[0.0] * len(ACTION_NAMES),
+        ).to_arrow()
+
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({"command": "stop", "reason": "测试"})]),
+    })
+    assert driver.admission_open is False
+    # stop 后迟到动作：入口关死，即使"此时有回合在等"也进不来
+    n_steps = len(env.step_calls)
+    driver.on_action(mk_action())
+    assert len(env.step_calls) == n_steps
+    assert driver.admission_dropped == 1
+    # 新 start 重开入口
+    _start_episode(driver, task="t", layout_id=1)
+    assert driver.admission_open is True
+    driver.close()
+
+
+def test_describe_returns_env_contract(cfg, node, env, monkeypatch):
+    """describe → eval_status 带环境契约（相机/动作空间集合/判分口径）。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _handshake(driver)
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({"command": "describe"})]),
+    })
+    d = [s for s in node.jsons("eval_status") if s.get("command") == "describe"][-1]
+    assert d["env_contract"]["accepted_action_spaces"] == ["ee", "joint"]
+    assert d["env_contract"]["action_spaces"]["joint"]["action_dim"] == 14
+    assert d["env_contract"]["judging"]["chunk_end_query"] == "official_2N_plus_1"
+    assert d["camera_map"]["image/head"] == "cam_head"
+    assert d["policy"]["policy_id"] == "FastWAM_80k_forge"     # 握手自报
+    driver.close()
+
+
+def test_status_reports_episode_and_batch(cfg, node, env, monkeypatch):
+    """status → 回合进度 + 批次进度。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _start_episode(driver, task="t", layout_id=0)
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({"command": "status"})]),
+    })
+    st = [s for s in node.jsons("eval_status") if s.get("command") == "status"][-1]
+    assert st["episode"]["task"] == "t"
+    assert st["episode"]["seq"] == 0
+    assert st["handshake_ok"] is True
+    driver.close()
+
+
+def test_policy_id_from_handshake_overrides_config(cfg, node, env, monkeypatch):
+    """通用身份 → 握手的 policy_id 覆盖 cfg（官方组装与打标以握手为准）。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    assert driver.cfg.policy_id == "auto"       # 配置通用化
+    _start_episode(driver, task="t", layout_id=0)
+    assert driver.cfg.policy_id == "FastWAM_80k_forge"   # 被握手覆盖
+    r = node.jsons("eval_status")[0]
+    assert r["command"] == "started"
+    driver.close()
+
+
+def test_live_check_rejects_mismatched_names(cfg, node, env, monkeypatch):
+    """活终检：握手自报与 env 活推导不一致 → 回合 failed（handshake_live_mismatch）。
+
+    场景：静态快检过（同样 14 维 joint 模板），但 FakeEnv 实际报告的分量名
+    与模板不同（模拟机器人换代后静态表过期的情形）——最终防线兜住。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    # 让 env 报告与模板不同的分量名（模拟环境变更后模板过期）
+    env.action_component_names = lambda: [f"newbot_joint.{i}" for i in range(14)]
+    driver = _make_driver(cfg, node, env)
+    _start_episode(driver, task="t", layout_id=0)
+    r = node.jsons("eval_result")[0]
+    assert r["status"] == "failed"
+    assert r["error_code"] == "handshake_live_mismatch"
+    # 尚未发首帧（失败发生在发布前）
+    assert [c for c, _ in node.sent].count("proprio_state") == 0
+    driver.close()
+
+
+def test_describe_uses_live_env_when_built(cfg, node, env, monkeypatch):
+    """env 已建后 describe 用活推导（accepted=['live']），未建时用静态快照。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    # env 未建：静态快照
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({"command": "describe"})]),
+    })
+    d0 = [s for s in node.jsons("eval_status") if s.get("command") == "describe"][-1]
+    assert d0["env_contract"]["accepted_action_spaces"] == ["ee", "joint"]
+    # env 已建：活推导
+    _start_episode(driver, task="t", layout_id=0)
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({"command": "describe"})]),
+    })
+    d1 = [s for s in node.jsons("eval_status") if s.get("command") == "describe"][-1]
+    assert d1["env_contract"]["accepted_action_spaces"] == ["live"]
+    assert d1["env_contract"]["action_spaces"]["live"]["action_dim"] == len(ACTION_NAMES)
     driver.close()

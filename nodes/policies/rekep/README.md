@@ -75,3 +75,7 @@ side is `nodes/benchmarks/robodojo_eval/`, which needs
   (`paos skill start robodojo-bench`) has since been removed from this repo; the
   evaluation entrypoint is now the standalone `robodojo_eval` node driven via
   `eval_command` (see `nodes/benchmarks/robodojo_eval/README.md`).
+
+## 协议 v2（评测端两级握手）
+
+ready 时经 `runtime.set_handshake()` 上报契约自报（policy_id="rekep"/action_type=ee/obs_state_dim=28）；reset_scene 后自动回 reset_ack；动作经 action_meta 回带回合身份（每帧制：chunk_per_action=true，每个动作都带 effort 哨兵）。字段表见 `policy/src/forge_policy/HANDSHAKE_FIELDS.md`。

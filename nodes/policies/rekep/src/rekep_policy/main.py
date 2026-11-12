@@ -171,7 +171,15 @@ def main() -> int:
         executor=modules["executor"],
         log=lambda m: print(f"[rekep_policy] {m}", flush=True),
     )
-    return PolicyRuntime(policy, contract).run()
+    runtime = PolicyRuntime(policy, contract)
+    # 契约自报（协议 v2 握手）：随 ready 上报，评测端校验后启动回合。
+    runtime.set_handshake(
+        policy_id="rekep",
+        action_type=profile.action_space,
+        weight_id=os.environ.get("WEIGHT_ID"),
+        obs_state_dim=28,  # arx_x5 观测 28 维（ee 模式同样消费 28 维 proprio）
+    )
+    return runtime.run()
 
 
 def _self_test_profile() -> RobotProfile:
