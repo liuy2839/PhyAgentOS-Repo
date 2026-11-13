@@ -89,9 +89,11 @@ scripts/deploy_rekep_policy.sh     策略侧部署（rsync + venv + 冒烟）
 `set_instruction`(最终) → 首帧（带 obs_meta：episode_id + seq；动作须回带
 同回合身份）。**握手两级校验**：启动期快检（静态快照挡明显错配）+ env 建好
 后的**活终检**（对照 `env.action_component_names()` 活推导逐字比对，机器人
-换代零代码改动）。运行中协议：策略 failed 上报 → 回合立即 failed；看门狗放弃
-上限（give_up_after_s / max_republishes）→ failed 带证据；stop **关闭动作
-入口**（迟到动作从状态上不可消费）；结果含实际生效参数与官方原生
+换代零代码改动）。运行中协议：策略 failed 上报 → 回合立即 failed；看门狗
+放弃检查用**独立时钟**（give_up_after_s / max_republishes，高频消息不会饿
+死放弃判定）→ failed 带证据；stop **关闭动作入口并置停止标志**（收尾与
+调度分离——STOP 后下一回合结构性不可拉起）；结果含实际生效参数（步数
+三值 step_budget/env_step_lim/max_steps、布局实际值+请求值）与官方原生
 _result.json 路径，原子写入唯一回合目录。
 **策略身份通用化**：配置的 `policy_id` 是占位（默认 `auto`），启动时被握手
 自报覆盖——官方组装、打标、结果标注以策略自报为准。
@@ -118,8 +120,11 @@ success_rate + per_task 明细）并落盘 `batch_result_<batch_id>.json`。
 ## 启动
 
 两节点**必须用不同的 python env**（isaacsim 5.1 钉 py3.10，策略侧独立 env）。
-依赖：`dora-rs==0.4.1`、`numpy`、`pyarrow`、`pyyaml`（评测侧另需
-`opencv-python` 录像）。
+依赖（**版本基线**——Isaac Sim 5.1 钉 numpy 1.x，pyarrow≥25 要 numpy≥2，
+混装会让评测节点 import 直接炸，上机实测教训）：`dora-rs==0.4.1`、
+`numpy>=1.24,<2.0`、`pyarrow>=14,<25`、`pyyaml>=6.0`（评测侧另需
+`opencv-python` 录像；版本约束已写入 `nodes/benchmarks/robodojo_eval/
+pyproject.toml`）。
 
 评测节点（RoboDojo conda env；`TMPDIR` 共享机上指到自己的目录）：
 

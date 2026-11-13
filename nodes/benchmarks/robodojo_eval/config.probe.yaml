@@ -1,0 +1,25 @@
+# 探针专用评测配置：give_up 调短（90s），快速验证看门狗独立时钟。
+benchmark: robodojo
+env_cfg_type: arx_x5
+device_id: 2
+action_type: joint
+policy_id: auto
+additional_info: forge
+seed: 0
+
+result_dir: /data1/liuyi/probe_fixes_out/results
+
+watchdog_s: 20.0
+give_up_after_s: 90.0
+max_republishes: 30
+
+init_states_per_task: 50
+max_steps_default: 1050
+
+publish_scene_objects: false
+publish_camera_info: false
+
+camera_map:
+  image/head: cam_head
+  image/left_wrist: cam_left_wrist
+  image/right_wrist: cam_right_wrist

@@ -56,9 +56,24 @@ failed 带证据（等了多久/重发几次/卡在哪个 seq）；stop → 回�
 weight_id）、官方原生 `_result.json` 路径、协议诊断（握手/确认/丢弃计数）、
 唯一回合目录 + 原子写入（写失败 → 结果状态标 failed，不假交付）。
 
-**停止语义**：stop 时**关闭动作入口**（Driver 级状态，跨回合持有）——此后
-迟到的动作从状态上不可能再被消费（拒绝计数进结果诊断）；下一条 start/run
-显式重开入口。
+**停止语义**（收尾与调度分离）：stop（编排 stop 与 dora 原生 STOP 两条路径
+等价）时 ① 关闭动作入口（此后迟到动作从状态上不可消费，拒绝计数进结果）
+② 置 Driver 级 `batch_stopped` 标志 ③ 只做本回合收尾——**调度被结构性封锁**
+（开下一回合的唯一入口 `_maybe_advance` 检查三重门：batch 活 / status
+running / 停止标志未置），stop 后第二回合不可能被拉起；下一条 start/run
+重置标志与入口。**失败分级**：动作级错误（invalid_action/step_error）回合
+failed 后批次照常推进；策略已死级失败（policy_failed / 看门狗放弃 /
+握手活校验失败）批次立即收尾（状态 failed）不再继续。
+
+**看门狗独立时钟**：放弃检查（give_up_after_s / max_republishes）用墙钟
+判断、任何事件处理后都执行——编排方高频发 status 查询**不会**饿死放弃
+检查（防消息饥饿）；重发（republish）保留在空闲超时分支（被饿死无害）。
+
+**步数三值与 seed 分离**：`effective` 记录 `step_budget`（命令预算）、
+`env_step_lim`（任务上限）、`max_steps`（实际生效 = 两者取小）——请求
+2 步就真的只跑 2 步；批次的 `seed` 经 `eval_seed` 字段透传到回合（与
+接口① 的布局同义 `seed` 是两个旋钮）；`layout_id` 记实际生效值（附
+`requested_layout_id` 对照）。
 
 **策略身份通用化**：config 的 `policy_id` 是占位（默认 `auto`），回合启动时
 被握手自报的 policy_id 覆盖——官方 env_cfg 组装、policy_command 打标、结果

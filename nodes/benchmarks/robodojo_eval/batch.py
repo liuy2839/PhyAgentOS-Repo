@@ -243,6 +243,10 @@ def episode_command_from_plan(
         "output_dir": os.path.join(
             plan.output_root, f"{batch_id}", f"{task}_L{layout_id}_r{run_index + 1}"
         ),
-        # 批次的 max_steps/seed 透传到回合（回合内还会被任务 step_lim 修正）
+        # 批次参数透传（《问题.md》设计问题 1：seed 此前在计划→命令的传递中
+        # 丢失）。注意语义分离：`eval_seed` 是随机化种子（benchmark-plan 的
+        # seed，进 env_cfg），与接口① 的 `seed` 字段（布局 ID 同义）是两个
+        # 旋钮——批次透传用 eval_seed，避免被当成布局触发不一致拒绝。
         **({"max_steps": plan.max_steps} if plan.max_steps else {}),
+        **({"eval_seed": plan.seed} if plan.seed is not None else {}),
     }
