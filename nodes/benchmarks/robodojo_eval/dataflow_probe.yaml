@@ -1,0 +1,49 @@
+# 五项修复探针的 dataflow：probe_orchestrator + robodojo_eval 两节点。
+#
+# 用法（zy2d）：
+#   cd /data1/liuyi/probe_fixes_out
+#   dora up
+#   dora run dataflow_probe.yaml --uv  （或直接 dora run dataflow_probe.yaml）
+#
+# 探针节点（probe_orchestrator）模拟编排方：发 run/start/stop/status，
+# 订阅 eval_status / eval_result 验证五项修复。
+# fastwam_policy 不在本 dataflow——策略缺席时回合会卡在等动作，
+# 这正是验证 stop 封闭与看门狗放弃所需的状态。
+
+nodes:
+  - id: probe_orchestrator
+    path: /data1/liuyi/miniconda3/envs/paos/bin/python
+    args: -u /data1/liuyi/PhyAgentOS-Repo/nodes/benchmarks/robodojo_eval/probe_node.py
+    # tick 输入：dora 0.4.1 对"只发不收"节点（无任何 input）的 send_output
+    # 在数据流图里不可靠（实测 describe 发出但下游收不到）。给节点挂一个
+    # 心跳输入让它成为图里的完整成员；探针脚本忽略 tick 事件本身。
+    inputs:
+      tick: dora/timer/millis/1000
+    outputs:
+      - eval_command
+
+  - id: robodojo_eval
+    path: /data1/liuyi/miniconda3/envs/RoboDojo/bin/python
+    args: -u /data1/liuyi/PhyAgentOS-Repo/nodes/benchmarks/robodojo_eval/main.py
+    env:
+      EVAL_CONFIG: /data1/liuyi/probe_fixes_out/probe_config.yaml
+      ROBODOJO_ROOT: /data2/kangning/fastwam_eval/RoboDojo
+      PYTHONPATH: /data2/kangning/fastwam_eval/RoboDojo/XPolicyLab
+      CUDA_VISIBLE_DEVICES: "2"
+      LD_LIBRARY_PATH: /data1/liuyi/miniconda3/envs/RoboDojo/lib
+      OMNI_KIT_ACCEPT_EULA: "YES"
+      TMPDIR: /data1/liuyi/tmp
+      TEMP: /data1/liuyi/tmp
+      TMP: /data1/liuyi/tmp
+    inputs:
+      eval_command: probe_orchestrator/eval_command
+      # action 无策略输入：回合会卡在等动作（探针场景所需）
+    outputs:
+      - proprio_state
+      - image/head
+      - image/left_wrist
+      - image/right_wrist
+      - obs_meta
+      - policy_command
+      - eval_status
+      - eval_result

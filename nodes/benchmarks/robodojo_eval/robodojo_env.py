@@ -364,6 +364,11 @@ class RoboDojoEpisodeEnv:
         return obs
 
     @property
+    def effective_layout_id(self) -> int | None:
+        """reset 实际使用的布局 ID（请求值可能经清单索引转换）。"""
+        return self._current_layout_id
+
+    @property
     def env_instruction(self) -> str | None:
         """首帧观测里的官方指令（desc_manager 按当前场景生成，reset 前不存在）。"""
         obs = self._last_obs or {}
@@ -456,14 +461,13 @@ class RoboDojoEpisodeEnv:
         """官方 eval 链路的 _result.json 路径（判分的原始证据）。
 
         RoboDojo 官方评测在 episode 结束时按 `eval_result/<benchmark>/<task>/
-        <policy>/` 落盘原生结果。路径规则以官方 eval_client 实现为准，这里只做
-        惰性探测（找不到就返回 None，不猜路径伪造证据）。
+        <policy>/` 落盘原生结果。任务名取 `_env_task_name`（env 实际构建时
+        记录的——此前误用不存在的 `self.tasks`，恒返回 None，《问题.md》
+        工程问题）。找不到就返回 None，不猜路径伪造证据。
         """
         env = self._env
-        if env is None:
-            return None
-        task = self.tasks[0] if getattr(self, "tasks", None) else None
-        if not task:
+        task = self._env_task_name
+        if env is None or not task:
             return None
         candidates = [
             os.path.join("eval_result", self._benchmark, task, self.cfg.policy_id),

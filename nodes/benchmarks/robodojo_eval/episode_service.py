@@ -36,6 +36,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import numpy as np     # 可选观测通道（depth/seg）的数组处理；此前缺失导致
+                       # publish_* 开启时 NameError（《问题.md》工程问题）
+
 # eval_command 的载荷类型
 CMD_START = "start_episode"
 CMD_STOP = "stop"
@@ -133,6 +136,9 @@ class _Episode:
     step_started_at: float | None = None   # 本步开始等待的时刻（放弃上限计时）
     last_status: str = ""           # 终局状态（批次摘要用）
     last_success: bool = False
+    # ---- 步数预算与环境上限分离（《问题.md》设计问题 1）----
+    step_budget: int | None = None  # 本次执行预算（命令给的 max_steps；None=不设预算）
+    env_step_lim: int = 0           # 环境上限（任务的 step_lim，reset 后回填）
 
 
 class EpisodeDriver:
@@ -185,6 +191,10 @@ class EpisodeDriver:
         # 停过，重开是自然语义。
         self.admission_open = True
         self.admission_dropped = 0      # 入口关闭期间拒绝的动作计数
+        # Driver 级停止标志（《问题.md》设计问题 2）：任何停止入口（dora STOP /
+        # 编排 stop / 错误收尾）置位后，调度对一切后续回合死心——它独立于
+        # batch 对象（batch 收尾清空后仍活着），start/run 显式重置。
+        self.batch_stopped = False
 
     # ---- 协议：policy_status 处理 ----
 
@@ -211,6 +221,7 @@ class EpisodeDriver:
                 self._fail_current(
                     "policy_failed",
                     f"策略失败：{self.policy_failed['error_code']} {self.policy_failed['message']}",
+                    fatal=True,
                 )
         elif status == "stopped":
             self.policy_stopped = True
@@ -369,6 +380,7 @@ class EpisodeDriver:
                 f"等待 action 超时放弃：seq={ep.seq} 已重发观测 {ep.republishes} 次、"
                 f"累计等待 {total_wait:.0f}s（give_up_after_s={give_up_after_s} "
                 f"max_republishes={max_republishes}）",
+                fatal=True,
             )
             return
         ep.republishes += 1
@@ -421,8 +433,20 @@ class EpisodeDriver:
             })
             return
         layout_id = int(layout_id) if layout_id is not None else 0
+        # 步数预算与环境上限分离（《问题.md》设计问题 1）：命令的 max_steps 是
+        # **本次执行预算**（跑这么几步就收），环境的 step_lim 是**任务上限**
+        # （这个任务最多能跑几步）。两者独立记录，实际生效 = 两者取小——
+        # 请求 2 步就真的只跑 2 步，不再被环境的 100 步静默吞掉。
         if cmd.get("max_steps") is not None:
             self.cfg.max_steps_default = int(cmd["max_steps"])
+        step_budget: int | None = (
+            int(cmd["max_steps"]) if cmd.get("max_steps") is not None else None
+        )
+        # 随机化种子（eval_seed，进 env_cfg 供官方组装）；与 layout_id/seed
+        # （布局同义）是两个旋钮。命令给了就覆盖 cfg.seed（活引用，env 组装
+        # 和结果记录都读它）。
+        if cmd.get("eval_seed") is not None:
+            self.cfg.seed = int(cmd["eval_seed"])
         round_no = cmd.get("round")
         given = cmd.get("instruction")
         given = str(given).strip() if isinstance(given, str) and given.strip() else None
@@ -464,13 +488,14 @@ class EpisodeDriver:
             round=int(round_no) if round_no is not None else None,
             given_instruction=given,
             output_dir=output_dir,
-            # step_lim 由 env 在 reset 后按任务回填（robodojo_env.reset_episode）；
-            # 这里先给兜底值。
+            # 环境上限由 env 在 reset 后回填 episode_step_lim（robodojo_env）；
+            # 这里先给兜底值。实际生效 = min(预算[若设], 环境上限)。
             max_steps=int(self.cfg.max_steps_default),
             recorder=recorder_cls(os.path.join(output_dir, "videos"), fps=30.0, log=tee),
             tee=tee,
             log_path=os.path.join(output_dir, "episode.log"),
             episode_id=episode_id,
+            step_budget=step_budget,
         )
         self.episode = ep
         self.policy_failed = None
@@ -494,8 +519,12 @@ class EpisodeDriver:
             self._policy_command("reset_scene")
 
             obs = self.env.reset_episode(task, layout_id)
+            # 步数上限：环境上限回填后，实际生效 = min(预算[若设], 环境上限)。
+            # 预算和环境上限分开记录（effective 两格），不再静默覆盖。
             if self.env.episode_step_lim:
-                ep.max_steps = int(self.env.episode_step_lim)
+                ep.env_step_lim = int(self.env.episode_step_lim)
+                env_lim = int(self.env.episode_step_lim)
+                ep.max_steps = min(env_lim, step_budget) if step_budget else env_lim
 
             # 最终防线（协议 v2）：env 已建，用活推导的分量名表做终检——
             # 静态快检挡不住的（env_cfg_type 变更、机器人换代）在这里兜住。
@@ -512,12 +541,18 @@ class EpisodeDriver:
                 if not live.ok:
                     for e in live.errors:
                         self._log_line(f"活校验不通过：{e}")
+                    # 活检失败 = 策略与环境根本不匹配：fatal（批次收尾），
+                    # 编排方换策略/契约后再来。
+                    self.batch_stopped = True
+                    if self.batch is not None:
+                        self.batch.status = "failed"
                     self._finalize(
                         TERMINATION_FAILED,
                         status=STATUS_FAILED,
                         error_code="handshake_live_mismatch",
                         error_message="；".join(live.errors),
                     )
+                    self._close_batch_now()
                     return
 
             env_instr = self.env.env_instruction
@@ -617,11 +652,18 @@ class EpisodeDriver:
             sum(ep.latencies) / len(ep.latencies) if ep.latencies else None
         )
         # 实际生效参数（《修改方案》：结果保存实际生效参数）——命令给的是"要的"，
-        # 这里记录"跑的"：布局（env 可能按清单解析）、步数上限（按任务 step_lim
-        # 修正）、随机化 seed、握手到的策略身份。
+        # 这里记录"跑的"：布局用 **env 实际使用的值**（请求值可能经清单索引
+        # 转换，《问题.md》工程问题：原生结果定位失效的同源问题）、步数的三
+        # 个值（预算/环境上限/实际生效）、随机化 seed、握手到的策略身份。
+        effective_layout = ep.layout_id
+        if self.env is not None and hasattr(self.env, "effective_layout_id"):
+            effective_layout = self.env.effective_layout_id or ep.layout_id
         effective: dict[str, Any] = {
-            "layout_id": ep.layout_id,
-            "max_steps": ep.max_steps,
+            "layout_id": effective_layout,
+            "requested_layout_id": ep.layout_id,
+            "step_budget": ep.step_budget,        # 命令给的预算（None=不设）
+            "env_step_lim": ep.env_step_lim,      # 任务的 step_lim
+            "max_steps": ep.max_steps,            # 实际生效 = min(预算, 上限)
             "eval_cfg_seed": getattr(self.cfg, "seed", None),
             "instruction": ep.effective_instruction,
         }
@@ -701,9 +743,11 @@ class EpisodeDriver:
         ep.last_status = payload["status"]
         ep.last_success = bool(success)
         self.episode = None
-        # 批次进行中：记录摘要并驱动下一回合（或收批次）。注意在 episode=None
-        # 之后调用——下一回合的 _start_episode 需要"当前无回合"状态。
-        self._advance_batch(ep)
+        # 调度不在这里（《问题.md》设计问题 2：收尾与调度分离）——_finalize
+        # 会被停止路径调用（dora STOP / 编排 stop / 错误收尾），无条件推进
+        # 调度曾让"STOP 后第二回合仍被拉起"。推进权上交给调用方：只有正常
+        # 终局路径（on_action 的 done/max_steps 分支）才调 _maybe_advance；
+        # 停止/失败路径只收尾，结构性不可能再开下一回合。
 
     # ---- 入站 ----
 
@@ -722,17 +766,23 @@ class EpisodeDriver:
             self._start_episode(cmd)
             return None
         if kind == CMD_STOP:
+            # 停止入口 1（编排 JSON stop）：《问题.md》设计问题 2——先置停止
+            # 态，再收尾；停止路径不进调度（_finalize 不含 _maybe_advance）。
+            self.batch_stopped = True
             if self.episode is None or self.episode.finished:
+                self._close_batch_now()       # 无回合可收：直接收批次
                 return None
             # 关闭动作入口（《修改方案》：停止时关闭动作入口）——Driver 级
             # 状态，跨回合持有：此后迟到的动作从状态上不可能再被消费。
             self.admission_open = False
             self.episode.admission_open = False
             self._log_line(f"收到 stop（{cmd.get('reason')}），动作入口已关闭，收尾本回合")
-            # 批次进行中：回合照常收尾（stopped），但批次不再开下一回合
+            # 批次进行中：回合照常收尾（stopped），但批次不再开下一回合；
+            # _finalize 之后批次也在本路径收掉（不依赖任何后续调度）。
             if self.batch is not None:
                 self.batch.status = "stopped"
             self._finalize(TERMINATION_STOPPED, status=STATUS_STOPPED)
+            self._close_batch_now()
             return None
         if kind == CMD_RUN_BATCH:
             return self._start_batch(cmd)
@@ -908,8 +958,15 @@ class EpisodeDriver:
                 pass
         return []
 
-    def _advance_batch(self, ep: "_Episode") -> None:
-        """回合终局后由 _finalize 调用：记录摘要、开下一回合或收批次。"""
+    def _maybe_advance(self, ep: "_Episode") -> None:
+        """批次的**唯一调度入口**（《问题.md》设计问题 2：收尾与调度分离）。
+
+        三重门全过才开下一回合，任何一门关着只收批次：
+          1. batch 活着（self.batch 非 None）；
+          2. batch.status == "running"（stopped/failed 已终结）；
+          3. Driver 级停止标志未置（batch_stopped——dora STOP / 编排 stop /
+             错误收尾都置位；它独立于 batch 对象，batch 收尾清空后仍活着）。
+        """
         if self.batch is None:
             return
         from batch import episode_command_from_plan, write_batch_result
@@ -925,29 +982,35 @@ class EpisodeDriver:
             "result_json": os.path.join(ep.output_dir, "episode_result.json"),
         })
         nxt = self.batch.current()
-        if nxt is None or self.batch.status == "stopped":
-            self.batch.status = self.batch.status if self.batch.status == "stopped" else "succeeded"
-            path = write_batch_result(
-                self.batch, os.path.join(self.batch.plan.output_root,
-                                         f"batch_result_{self.batch.batch_id}.json")
+        if (
+            nxt is not None
+            and self.batch.status == "running"
+            and not self.batch_stopped
+        ):
+            task, layout_id, run_index = nxt
+            nxt_cmd = episode_command_from_plan(
+                self.batch.plan, task, layout_id, run_index, self.batch.batch_id
             )
-            self._emit("eval_result", {
-                "kind": "batch",
-                **self.batch.summarize(),
-                "batch_result_json": path,
-            })
-            self._log(
-                f"批次 {self.batch.batch_id} 结束：{self.batch.status}，"
-                f"{self.batch.completed if hasattr(self.batch, 'completed') else len(self.batch.episode_summaries)}"
-                f"/{self.batch.plan.total} → {path}"
-            )
-            self.batch = None
+            self.on_eval_command(json.dumps(nxt_cmd, ensure_ascii=False))
             return
-        task, layout_id, run_index = nxt
-        nxt_cmd = episode_command_from_plan(
-            self.batch.plan, task, layout_id, run_index, self.batch.batch_id
+        # 三门有任一关着：收批次（状态按现状标——stopped 保留，其余按有
+        # 停止标志与否定名）。
+        if self.batch.status == "running":
+            self.batch.status = "stopped" if self.batch_stopped else "succeeded"
+        path = write_batch_result(
+            self.batch, os.path.join(self.batch.plan.output_root,
+                                     f"batch_result_{self.batch.batch_id}.json")
         )
-        self.on_eval_command(json.dumps(nxt_cmd, ensure_ascii=False))
+        self._emit("eval_result", {
+            "kind": "batch",
+            **self.batch.summarize(),
+            "batch_result_json": path,
+        })
+        self._log(
+            f"批次 {self.batch.batch_id} 结束：{self.batch.status}，"
+            f"{len(self.batch.episode_summaries)}/{self.batch.plan.total} → {path}"
+        )
+        self.batch = None
 
     def on_action(self, value: Any, meta: dict[str, Any] | None = None) -> None:
         # 动作入口（《修改方案》：停止时关闭动作入口）：stop 后入口关死，
@@ -1024,6 +1087,7 @@ class EpisodeDriver:
                 status=STATUS_SUCCEEDED,
                 success=outcome.success,
             )
+            self._maybe_advance(ep)       # 正常终局：推进批次（唯一调度入口）
             return
         if ep.steps >= ep.max_steps:
             ep.final_score = outcome.score
@@ -1032,18 +1096,85 @@ class EpisodeDriver:
                 status=STATUS_SUCCEEDED,
                 success=False,
             )
+            self._maybe_advance(ep)       # 正常终局：推进批次
             return
         ep.step_started_at = time.time()
         self._publish_obs(outcome.obs)
 
-    def _fail_current(self, code: str, message: str) -> None:
+    def _fail_current(self, code: str, message: str, fatal: bool = False) -> None:
+        """回合失败收尾。`fatal=True` 表示**策略已死级失败**（策略上报失败/
+        看门狗放弃/握手活校验失败/环境启动失败）——批次继续无意义，置停止
+        标志且不推进调度；`fatal=False`（动作级错误）批次照常推进下一回合。"""
         self._log_line(f"回合失败：{code} {message}")
+        if fatal:
+            self.batch_stopped = True
+            if self.batch is not None:
+                self.batch.status = "failed"
+        ep = self.episode
         self._finalize(
             TERMINATION_FAILED,
             status=STATUS_FAILED,
             error_code=code,
             error_message=message,
         )
+        if fatal:
+            self._close_batch_now()       # 策略已死：批次立即收尾发汇总
+        elif ep is not None:
+            self._maybe_advance(ep)       # 动作级失败：批次照常推进下一回合
+
+    def _close_batch_now(self) -> None:
+        """批次立即收尾（fatal 失败路径）：发汇总 + 落盘 + 清引用。"""
+        if self.batch is None:
+            return
+        from batch import write_batch_result
+
+        if self.batch.status == "running":
+            self.batch.status = "failed"
+        path = write_batch_result(
+            self.batch, os.path.join(self.batch.plan.output_root,
+                                     f"batch_result_{self.batch.batch_id}.json")
+        )
+        self._emit("eval_result", {
+            "kind": "batch",
+            **self.batch.summarize(),
+            "batch_result_json": path,
+        })
+        self._log(f"批次 {self.batch.batch_id} 提前收尾：{self.batch.status} → {path}")
+        self.batch = None
+
+    def check_watchdog(self) -> None:
+        """独立时钟看门狗（《问题.md》工程问题：看门狗超时检测 bug）。
+
+        放弃检查**不能只挂在 next(timeout) 的超时分支上**——那条分支只在
+        "watchdog_s 内没有任何消息"时才走，编排方高频发 status 查询会把它
+        饿死（每次消息都重置 dora 的等待），策略死掉后回合永久挂着。这里
+        用单调时钟独立判断：等待时长只取决于墙钟，与消息流量无关。
+        process_event 的**任何**事件处理后都调一次本方法。
+
+        重发（republish）仍只在 next 超时分支做——它是"空闲时补发"语义，
+        被消息饿死无害（消息多=链路活着）；放弃（give up）必须独立时钟。
+        """
+        ep = self.episode
+        if ep is None or ep.finished or not ep.awaiting_action:
+            return
+        if ep.obs_sent_at is None:
+            return
+        give_up_after_s = getattr(self.cfg, "give_up_after_s", 0) or 0
+        if not give_up_after_s:
+            return
+        total_wait = time.time() - (ep.step_started_at or ep.obs_sent_at)
+        max_republishes = getattr(self.cfg, "max_republishes", 0) or 0
+        if total_wait >= give_up_after_s or (
+            max_republishes and ep.republishes >= max_republishes
+        ):
+            self._fail_current(
+                "policy_wait_timeout",
+                f"等待 action 超时放弃（独立时钟）：seq={ep.seq} 已重发观测 "
+                f"{ep.republishes} 次、累计等待 {total_wait:.0f}s"
+                f"（give_up_after_s={give_up_after_s} "
+                f"max_republishes={max_republishes}）",
+                fatal=True,
+            )
 
     def on_timeout(self) -> None:
         # reset 确认协议的发布点：ack 已到或超时兜底到了，发布暂存的首帧
@@ -1055,12 +1186,25 @@ class EpisodeDriver:
     def process_event(self, event: Any) -> int | None:
         if event is None or _is_timeout(event):
             self.on_timeout()
+            self.check_watchdog()
             return None
 
         etype = event.get("type") if isinstance(event, dict) else None
+        # 独立时钟看门狗：任何事件（含高频 status 查询）处理后都顺带检查——
+        # 放弃判据是墙钟时长，与消息流量无关（详见 check_watchdog docstring）。
+        self.check_watchdog()
+        if self.episode is not None and self.episode.finished:
+            return None
         if etype == "STOP":
+            # 停止入口 2（dora 原生 STOP）：《问题.md》设计问题 2 的真正漏洞——
+            # 此前这条分支不置停止态，_finalize→_advance_batch 照常开下一回合
+            # （探针实测复现）。先置位，再收尾；批次在本路径直接收掉。
+            self.batch_stopped = True
+            if self.batch is not None:
+                self.batch.status = "stopped"
             if self.episode is not None and not self.episode.finished:
                 self._finalize(TERMINATION_STOPPED, status=STATUS_STOPPED)
+            self._close_batch_now()
             return 0
         if etype == "ERROR":
             self._log(f"dora error: {event.get('error')}")
@@ -1113,6 +1257,10 @@ class EpisodeDriver:
             self.env.close()
 
     def run(self) -> int:
+        # 就绪信号（协议 v2）：dora 0.4.1 的消息对"接收方未就绪"不缓冲——
+        # 编排方若先于本节点发命令会被静默丢弃。所以本节点就绪后必须主动
+        # 广播 node_ready，编排方收到才开始发命令。
+        self._emit("eval_status", {"command": "node_ready"})
         self._log(
             f"评测发起节点就绪：env_cfg={self.cfg.env_cfg_type} action_type={self.cfg.action_type} "
             f"policy_id={self.cfg.policy_id}，等待 eval_command"

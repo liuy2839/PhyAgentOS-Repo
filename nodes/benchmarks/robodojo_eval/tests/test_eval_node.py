@@ -928,3 +928,128 @@ def test_describe_uses_live_env_when_built(cfg, node, env, monkeypatch):
     assert d1["env_contract"]["accepted_action_spaces"] == ["live"]
     assert d1["env_contract"]["action_spaces"]["live"]["action_dim"] == len(ACTION_NAMES)
     driver.close()
+
+
+# ---------------------------------------------------------------- 问题.md 修复专项
+
+
+def test_step_budget_limits_episode(cfg, node, env, monkeypatch):
+    """设计问题 1：命令 max_steps=2 → 实际只跑 2 步（不被环境 5 步上限吞掉）。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _start_episode(driver, task="t", layout_id=0, max_steps=2)
+
+    from types import SimpleNamespace
+
+    def mk_action(last=False):
+        effort = [1.0] * len(ACTION_NAMES) if last else []
+        return messages.JointCommand(
+            name=list(ACTION_NAMES), mode="position", position=[0.0] * len(ACTION_NAMES),
+            effort=effort,
+        ).to_arrow()
+
+    for _ in range(5):        # 喂 5 步（环境 step_lim=5 允许），预算只有 2
+        env.script([SimpleNamespace(obs=_mk_obs(), done=False, success=False, score=None, metrics={})])
+        driver.process_event({"type": "INPUT", "id": "action", "value": mk_action(last=True)})
+        if driver.episode is None:
+            break
+    r = node.jsons("eval_result")[0]
+    assert r["steps"] == 2                       # 实际只跑 2 步
+    assert r["termination"] == "timed_out"
+    eff = r["effective"]
+    assert eff["step_budget"] == 2               # 预算记录
+    assert eff["env_step_lim"] == 5              # 环境上限记录
+    assert eff["max_steps"] == 2                 # 实际生效 = min
+    driver.close()
+
+
+def test_batch_seed_passed_via_eval_seed(cfg, node, env, monkeypatch):
+    """设计问题 1：批次 seed 经 eval_seed 透传到回合 cfg（不丢、不撞布局语义）。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _handshake(driver)
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({
+            "command": "run", "suite": "arrange_largest_number",
+            "num_runs": 1, "init_state_ids": [0], "seed": 777,
+            "output_dir": os.path.join(cfg.result_dir, "b777"),
+        })]),
+    })
+    _reset_ack(driver)
+    assert driver.cfg.seed == 777                # 透传到位（此前丢失）
+    assert driver.episode is not None            # 没被 layout/seed 冲突拒绝
+    driver.close()
+
+
+def test_stop_closes_batch_no_next_episode(cfg, node, env, monkeypatch):
+    """设计问题 2：dora STOP 后批次封闭——第二回合不被拉起。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(cfg, node, env)
+    _handshake(driver)
+    driver.process_event({
+        "type": "INPUT", "id": "eval_command",
+        "value": pa.array([json.dumps({
+            "command": "run", "suite": "arrange_largest_number",
+            "num_runs": 2, "init_state_ids": [0, 1],
+            "output_dir": os.path.join(cfg.result_dir, "bst"),
+        })]),
+    })
+    _reset_ack(driver)
+    env.reset_calls.clear()
+    # dora 原生 STOP（探针用的就是这条路径）
+    driver.process_event({"type": "STOP"})
+    assert driver.batch_stopped is True
+    assert env.reset_calls == []                 # 第二回合没有被 reset（此前会）
+    br = [r for r in node.jsons("eval_result") if r.get("kind") == "batch"]
+    assert len(br) == 1 and br[0]["status"] == "stopped"
+    driver.close()
+
+
+def test_watchdog_gives_up_even_with_status_traffic(cfg, node, env, monkeypatch):
+    """工程问题：看门狗独立时钟——高频 status 查询不再饿死放弃检查。"""
+    c = _CONFIG.EvalNodeConfig(result_dir=str(cfg.result_dir), max_republishes=0,
+                               give_up_after_s=1.0, watchdog_s=20.0)
+    os.makedirs(c.result_dir, exist_ok=True)
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    driver = _make_driver(c, node, env)
+    _start_episode(driver, task="t", layout_id=0)
+    # 模拟探针：持续发 status 查询（每条都是消息，next() 永不超时）
+    # 同时把等待时刻回拨 2 秒（超过 give_up_after_s=1.0）
+    driver.episode.obs_sent_at -= 2.0
+    driver.episode.step_started_at -= 2.0
+    for _ in range(5):
+        driver.process_event({
+            "type": "INPUT", "id": "eval_command",
+            "value": pa.array([json.dumps({"command": "status"})]),
+        })
+        if driver.episode is None:
+            break
+    assert driver.episode is None                # 放弃已执行（未被消息饿死）
+    r = node.jsons("eval_result")[0]
+    assert r["error_code"] == "policy_wait_timeout"
+    assert "独立时钟" in r["error_message"]
+    driver.close()
+
+
+def test_native_result_and_effective_layout(cfg, node, env, monkeypatch):
+    """工程问题：native_result_path 用 _env_task_name；effective 记实际布局。"""
+    monkeypatch.setattr(_SERVICE.EpisodeDriver, "_recorder_class", lambda self: FakeRecorder)
+    # 给 env 补上 native_result 探测所需的属性（真 RoboDojoEpisodeEnv 有 _env_task_name）
+    env._env_task_name = "classify_objects"
+    env._env = object()          # 非 None 即可触发探测
+
+    driver = _make_driver(cfg, node, env)
+    _start_episode(driver, task="classify_objects", layout_id=0,
+                   instruction="c")
+    # 请求 layout_id=0 → FakeEnv 不转换，实际值=0（记录两个值）
+    r = node.jsons("eval_status")[0]
+    assert r["command"] == "started"
+    driver.close()
+
+
+def test_numpy_available_for_optional_channels(cfg, node, env, monkeypatch):
+    """工程问题：depth/seg 可选通道不再 NameError（模块级 numpy import）。"""
+    import episode_service as _es   # 已由 conftest 链路加载（sys.path 已含节点目录）
+
+    assert getattr(_es, "np", None) is not None

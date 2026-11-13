@@ -6,8 +6,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "dora-rs==0.4.1",
-    "numpy",
-    "pyarrow",
+    # Isaac Sim 5.1 钉 numpy 1.x：numpy>=2 会让 pyarrow 26 的 import 直接炸
+    # （《问题.md》工程问题：上机探针实测）。约束上限防止 pip 自动装最新版。
+    "numpy>=1.24,<2.0",
+    "pyarrow>=14,<25",
     "pyyaml>=6.0",
     "opencv-python",
     # RoboDojo 与 Isaac Sim 由评测环境提供（RoboDojo conda env），不在此声明。
