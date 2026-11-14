@@ -218,6 +218,29 @@ python -m pytest nodes/policies/rekep/tests policy/tests -q --basetemp=<tmp>
 全部为纯逻辑单测（假 node / 假 env / 消息 round-trip），不需要 dora / Isaac /
 XPolicyLab / torch。合跑加 `--import-mode=importlib`。
 
+## Node、Endpoint 与 Tool API
+
+| 项目 | 当前实现 |
+| --- | --- |
+| 生产 Node | 4 个：`robodojo_eval`（评测发起，Isaac Sim 数据面）、`fastwam_policy`、`rekep_policy`、`pi05_policy`（策略执行）；`forge_policy` 是 SDK 库、`probe_node.py` 是探针工具，均不计入生产 Node |
+| Tool 支持 | 数据平面 Node：编排层经 dora 通道（`eval_command` → `eval_status` / `eval_result`）直驱；无 HTTP Tool API、无 Gateway、无 Endpoint |
+| Endpoint 数 | 0（数据平面节点，不注册 Forge Endpoint；见问题.md"控制面"层——可选的 Forge Endpoint 适配层属后续规划） |
+| operation 数 | 0（逻辑操作经 `eval_command` 的 command 字段承载：`start_episode` / `run` / `describe`（Query）/ `status` / `stop`） |
+| 直接 HTTP Tool API | 0（不监听 HTTP；调用方经 dora 通道） |
+| Gateway Tool 数 | 0（编排层经 dora 通道直驱） |
+
+**调用映射**：`eval_command`（JSON）→ robodojo_eval 内部 `EpisodeDriver`；命令
+语义见上文"接口"节（单回合 `start_episode` / 批次 `run` / 查询 `describe`、
+`status` / `stop`）。**协议契约**：消息 wire 格式对齐 forge-msgs 1.x（Arrow），
+字段规范见 `policy/src/forge_policy/HANDSHAKE_FIELDS.md`。
+
+**兼容性与构建**：`dora-rs==0.4.1`（版本基线）；`numpy>=1.24,<2.0`、
+`pyarrow>=14,<25`（Isaac Sim 5.1 钉 numpy 1.x，pyarrow≥25 需 numpy≥2——混装
+会让评测节点 import 直接炸，上机实测教训）；Python ≥3.10（评测侧）/ ≥3.11
+（策略侧）。构建：源码直接运行（`python main.py` / `python -m fastwam_policy.main`），
+无 PyInstaller 制品；依赖基线已写入
+`nodes/benchmarks/robodojo_eval/pyproject.toml` 与各策略节点 pyproject。
+
 ## 已知边界
 
 - FastWAM_80k_forge 从未在此协议实跑（此前只有 G05 在旧链路跑通过真实回合）；
