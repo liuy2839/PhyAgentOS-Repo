@@ -1,6 +1,6 @@
 [project]
 name = "forge-benchmark-robodojo-eval"
-version = "0.2.0"
+version = "0.2.1"
 description = "RoboDojo 评测发起独立节点（协议层 + 批次调度 + 官方判分口径）"
 readme = "README.md"
 requires-python = ">=3.10"
